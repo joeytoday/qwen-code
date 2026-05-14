@@ -11,6 +11,7 @@ import type { Config } from '@qwen-code/qwen-code-core';
 import {
   getErrorMessage,
   isNodeError,
+  Storage,
   unescapePath,
   readManyFiles,
 } from '@qwen-code/qwen-code-core';
@@ -181,7 +182,17 @@ export async function handleAtCommand({
 
     // Check if path should be ignored based on filtering options
     const workspaceContext = config.getWorkspaceContext();
-    if (!workspaceContext.isPathWithinWorkspace(pathName)) {
+
+    // Check if path is in project temp directory
+    const projectTempDir = Storage.getGlobalTempDir();
+    const absolutePathName = path.isAbsolute(pathName)
+      ? pathName
+      : path.resolve(workspaceContext.getDirectories()[0] || '', pathName);
+
+    if (
+      !absolutePathName.startsWith(projectTempDir) &&
+      !workspaceContext.isPathWithinWorkspace(pathName)
+    ) {
       onDebugMessage(
         `Path ${pathName} is not in the workspace and will be skipped.`,
       );
@@ -353,8 +364,10 @@ export async function handleAtCommand({
         description: file.isDirectory
           ? `Read directory ${path.basename(file.filePath)}`
           : `Read file ${path.basename(file.filePath)}`,
-        status: ToolCallStatus.Success,
-        resultDisplay: undefined,
+        status: file.error ? ToolCallStatus.Error : ToolCallStatus.Success,
+        resultDisplay: file.error
+          ? `Failed to read ${path.basename(file.filePath)}: ${file.error}`
+          : undefined,
         confirmationDetails: undefined,
       }),
     );

@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type {
   Config,
   SessionMetrics,
-  TaskResultDisplay,
+  AgentResultDisplay,
   ToolCallResponseInfo,
 } from '@qwen-code/qwen-code-core';
 import {
@@ -29,7 +29,8 @@ import {
   extractUsageFromGeminiClient,
   computeUsageFromMetrics,
   buildSystemMessage,
-  createTaskToolProgressHandler,
+  createToolProgressHandler,
+  createAgentToolProgressHandler,
   functionResponsePartsToString,
   toolResultContent,
 } from './nonInteractiveHelpers.js';
@@ -39,26 +40,36 @@ vi.mock('../nonInteractiveCliCommands.js', () => ({
   getAvailableCommands: vi
     .fn()
     .mockImplementation(
-      async (
-        _config: unknown,
-        _signal: AbortSignal,
-        allowedBuiltinCommandNames?: string[],
-      ) => {
-        const allowedSet = new Set(allowedBuiltinCommandNames ?? []);
+      async (_config: unknown, _signal: AbortSignal, mode: string = 'acp') => {
         const allCommands = [
-          { name: 'help', kind: 'built-in' },
-          { name: 'commit', kind: 'file' },
-          { name: 'memory', kind: 'built-in' },
-          { name: 'init', kind: 'built-in' },
-          { name: 'summary', kind: 'built-in' },
-          { name: 'compress', kind: 'built-in' },
-        ];
+          {
+            name: 'help',
+            supportedModes: ['interactive'] as const,
+          },
+          {
+            name: 'commit',
+            supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
+          },
+          {
+            name: 'memory',
+            supportedModes: ['interactive'] as const,
+          },
+          {
+            name: 'init',
+            supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
+          },
+          {
+            name: 'summary',
+            supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
+          },
+          {
+            name: 'compress',
+            supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
+          },
+        ] as const;
 
-        // Filter commands: always include file commands, only include allowed built-in commands
-        return allCommands.filter(
-          (cmd) =>
-            cmd.kind === 'file' ||
-            (cmd.kind === 'built-in' && allowedSet.has(cmd.name)),
+        return allCommands.filter((cmd) =>
+          (cmd.supportedModes as readonly string[]).includes(mode),
         );
       },
     ),
@@ -339,8 +350,8 @@ describe('computeUsageFromMetrics', () => {
             total: 150,
             cached: 10,
             thoughts: 0,
-            tool: 0,
           },
+          bySource: {},
         },
       },
       tools: {
@@ -381,8 +392,8 @@ describe('computeUsageFromMetrics', () => {
             total: 150,
             cached: 10,
             thoughts: 0,
-            tool: 0,
           },
+          bySource: {},
         },
         'model-2': {
           api: { totalRequests: 1, totalErrors: 0, totalLatencyMs: 100 },
@@ -392,8 +403,8 @@ describe('computeUsageFromMetrics', () => {
             total: 200,
             cached: 15,
             thoughts: 0,
-            tool: 0,
           },
+          bySource: {},
         },
       },
       tools: {
@@ -434,8 +445,8 @@ describe('computeUsageFromMetrics', () => {
             total: 0,
             cached: 10,
             thoughts: 0,
-            tool: 0,
           },
+          bySource: {},
         },
       },
       tools: {
@@ -519,12 +530,10 @@ describe('buildSystemMessage', () => {
   });
 
   it('should build system message with all fields', async () => {
-    const allowedBuiltinCommands = ['init', 'summary', 'compress'];
     const result = await buildSystemMessage(
       mockConfig,
       'test-session-id',
       'auto' as PermissionMode,
-      allowedBuiltinCommands,
     );
 
     expect(result).toEqual({
@@ -556,7 +565,6 @@ describe('buildSystemMessage', () => {
       config,
       'test-session-id',
       'auto' as PermissionMode,
-      ['init', 'summary'],
     );
 
     expect(result.tools).toEqual([]);
@@ -572,7 +580,6 @@ describe('buildSystemMessage', () => {
       config,
       'test-session-id',
       'auto' as PermissionMode,
-      ['init', 'summary'],
     );
 
     expect(result.mcp_servers).toEqual([]);
@@ -588,40 +595,151 @@ describe('buildSystemMessage', () => {
       config,
       'test-session-id',
       'auto' as PermissionMode,
-      ['init', 'summary'],
     );
 
     expect(result.qwen_code_version).toBe('unknown');
   });
 
-  it('should only include allowed built-in commands and all file commands', async () => {
-    const allowedBuiltinCommands = ['init', 'summary'];
+  it('should include local commands with ACP supportedModes and prompt commands', async () => {
     const result = await buildSystemMessage(
       mockConfig,
       'test-session-id',
       'auto' as PermissionMode,
-      allowedBuiltinCommands,
     );
 
-    // Should include: 'commit' (FILE), 'init' (BUILT_IN, allowed), 'summary' (BUILT_IN, allowed)
-    // Should NOT include: 'help', 'memory', 'compress' (BUILT_IN but not in allowed set)
-    expect(result.slash_commands).toEqual(['commit', 'init', 'summary']);
+    // Should include: 'commit' (prompt), 'compress', 'init', 'summary' (local+ACP)
+    // Should NOT include: 'help' (local-jsx), 'memory' (local without ACP supportedModes)
+    expect(result.slash_commands).toEqual([
+      'commit',
+      'compress',
+      'init',
+      'summary',
+    ]);
   });
 
-  it('should include only file commands when no built-in commands are allowed', async () => {
+  it('should exclude interactive-only commands from system message', async () => {
     const result = await buildSystemMessage(
       mockConfig,
       'test-session-id',
       'auto' as PermissionMode,
-      [], // Empty array - no built-in commands allowed
     );
 
-    // Should only include 'commit' (FILE command)
-    expect(result.slash_commands).toEqual(['commit']);
+    // 'help' (local-jsx) and 'memory' (local without ACP) should be excluded
+    expect(result.slash_commands).not.toContain('help');
+    expect(result.slash_commands).not.toContain('memory');
   });
 });
 
-describe('createTaskToolProgressHandler', () => {
+describe('createToolProgressHandler', () => {
+  const mockRequest = {
+    callId: 'tool-call-1',
+    name: 'mcp__echo-test__echo',
+    args: {},
+    isClientInitiated: false,
+    prompt_id: '',
+  };
+
+  it('should call emitToolProgress with request and McpToolProgressData', () => {
+    const mockAdapter = {
+      emitToolProgress: vi.fn(),
+    } as unknown as JsonOutputAdapterInterface;
+
+    const { handler } = createToolProgressHandler(mockRequest, mockAdapter);
+
+    const progressData = {
+      type: 'mcp_tool_progress' as const,
+      progress: 1,
+      total: 10,
+      message: 'Echo: 1',
+    };
+    handler('tool-call-1', progressData);
+
+    expect(mockAdapter.emitToolProgress).toHaveBeenCalledWith(
+      mockRequest,
+      progressData,
+    );
+  });
+
+  it('should not call emitToolProgress for non-McpToolProgressData output', () => {
+    const mockAdapter = {
+      emitToolProgress: vi.fn(),
+    } as unknown as JsonOutputAdapterInterface;
+
+    const { handler } = createToolProgressHandler(
+      { ...mockRequest, name: 'test_tool' },
+      mockAdapter,
+    );
+
+    // Pass a non-McpToolProgressData ToolResultDisplay (e.g., FileDiff)
+    handler('tool-call-1', {
+      fileDiff: 'diff',
+      fileName: 'test.ts',
+      originalContent: null,
+      newContent: 'new',
+    });
+
+    expect(mockAdapter.emitToolProgress).not.toHaveBeenCalled();
+
+    // Also test with a plain string — should not emit
+    handler('tool-call-1', 'plain string progress');
+
+    expect(mockAdapter.emitToolProgress).not.toHaveBeenCalled();
+  });
+
+  it('should forward multiple progress updates', () => {
+    const mockAdapter = {
+      emitToolProgress: vi.fn(),
+    } as unknown as JsonOutputAdapterInterface;
+
+    const browserRequest = {
+      ...mockRequest,
+      name: 'mcp__browser__navigate',
+    };
+    const { handler } = createToolProgressHandler(browserRequest, mockAdapter);
+
+    const progress1 = {
+      type: 'mcp_tool_progress' as const,
+      progress: 1,
+      total: 3,
+      message: 'Navigating...',
+    };
+    const progress2 = {
+      type: 'mcp_tool_progress' as const,
+      progress: 2,
+      total: 3,
+      message: 'Loading page...',
+    };
+    const progress3 = {
+      type: 'mcp_tool_progress' as const,
+      progress: 3,
+      total: 3,
+      message: 'Complete',
+    };
+
+    handler('tool-call-1', progress1);
+    handler('tool-call-1', progress2);
+    handler('tool-call-1', progress3);
+
+    expect(mockAdapter.emitToolProgress).toHaveBeenCalledTimes(3);
+    expect(mockAdapter.emitToolProgress).toHaveBeenNthCalledWith(
+      1,
+      browserRequest,
+      progress1,
+    );
+    expect(mockAdapter.emitToolProgress).toHaveBeenNthCalledWith(
+      2,
+      browserRequest,
+      progress2,
+    );
+    expect(mockAdapter.emitToolProgress).toHaveBeenNthCalledWith(
+      3,
+      browserRequest,
+      progress3,
+    );
+  });
+});
+
+describe('createAgentToolProgressHandler', () => {
   let mockAdapter: JsonOutputAdapterInterface;
   let mockConfig: Config;
 
@@ -641,13 +759,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should create handler that processes task tool calls', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -676,13 +794,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should emit tool_result when tool call completes', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -715,13 +833,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should not duplicate tool_use emissions', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -745,13 +863,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should not duplicate tool_result emissions', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -776,14 +894,14 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should handle status transitions from executing to completed', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
     // First: executing state
-    const executingDisplay: TaskResultDisplay = {
+    const executingDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -800,7 +918,7 @@ describe('createTaskToolProgressHandler', () => {
     };
 
     // Second: completed state
-    const completedDisplay: TaskResultDisplay = {
+    const completedDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -825,13 +943,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should emit error result for failed task status', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const runningDisplay: TaskResultDisplay = {
+    const runningDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -840,7 +958,7 @@ describe('createTaskToolProgressHandler', () => {
       toolCalls: [],
     };
 
-    const failedDisplay: TaskResultDisplay = {
+    const failedDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -861,13 +979,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should emit error result for cancelled task status', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const runningDisplay: TaskResultDisplay = {
+    const runningDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -876,7 +994,7 @@ describe('createTaskToolProgressHandler', () => {
       toolCalls: [],
     };
 
-    const cancelledDisplay: TaskResultDisplay = {
+    const cancelledDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -896,7 +1014,7 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should not process non-task-execution displays', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
@@ -907,20 +1025,20 @@ describe('createTaskToolProgressHandler', () => {
       content: 'some content',
     };
 
-    handler('call-id', nonTaskDisplay as unknown as TaskResultDisplay);
+    handler('call-id', nonTaskDisplay as unknown as AgentResultDisplay);
 
     expect(mockAdapter.processSubagentToolCall).not.toHaveBeenCalled();
     expect(mockAdapter.emitToolResult).not.toHaveBeenCalled();
   });
 
   it('should handle tool calls with failed status', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -951,13 +1069,13 @@ describe('createTaskToolProgressHandler', () => {
   });
 
   it('should handle tool calls without result content', () => {
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       mockAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',
@@ -986,13 +1104,13 @@ describe('createTaskToolProgressHandler', () => {
       emitToolResult: vi.fn(),
     } as unknown as JsonOutputAdapterInterface;
 
-    const { handler } = createTaskToolProgressHandler(
+    const { handler } = createAgentToolProgressHandler(
       mockConfig,
       'parent-tool-id',
       limitedAdapter,
     );
 
-    const taskDisplay: TaskResultDisplay = {
+    const taskDisplay: AgentResultDisplay = {
       type: 'task_execution',
       subagentName: 'test-agent',
       taskDescription: 'Test task',

@@ -9,8 +9,41 @@ import { promises as fs } from 'node:fs';
 import { v4 as uuidv4 } from 'uuid';
 import * as os from 'os';
 import { createDebugLogger } from './debugLogger.js';
+import { isInternalPromptId } from './internalPromptIds.js';
 
 const debugLogger = createDebugLogger('OPENAI_LOGGER');
+
+function sanitizeDiagnosticSuffix(
+  suffix: string | undefined,
+): string | undefined {
+  if (!suffix) return undefined;
+  const sanitized = suffix
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return sanitized || undefined;
+}
+
+function extractSubagentSuffix(promptId: string): string | undefined {
+  const parts = promptId.split('#');
+  if (parts.length !== 3) return undefined;
+
+  const [, subagentId, turn] = parts;
+  if (!subagentId || !turn || !/^\d+$/.test(turn)) {
+    return undefined;
+  }
+
+  return `subagent-${subagentId}`;
+}
+
+function promptIdSuffixForFilename(
+  promptId: string | undefined,
+): string | undefined {
+  if (!promptId) return undefined;
+  if (isInternalPromptId(promptId)) {
+    return sanitizeDiagnosticSuffix(promptId);
+  }
+  return sanitizeDiagnosticSuffix(extractSubagentSuffix(promptId));
+}
 
 /**
  * Logger specifically for OpenAI API requests and responses
@@ -22,8 +55,12 @@ export class OpenAILogger {
   /**
    * Creates a new OpenAI logger
    * @param customLogDir Optional custom log directory path (supports relative paths, absolute paths, and ~ expansion)
+   * @param cwd Optional working directory for resolving relative paths. Defaults to process.cwd().
+   *            In ACP mode, process.cwd() may be '/' (filesystem root), so callers should
+   *            pass the project working directory from Config.getWorkingDir().
    */
-  constructor(customLogDir?: string) {
+  constructor(customLogDir?: string, cwd?: string) {
+    const baseCwd = cwd || process.cwd();
     if (customLogDir) {
       // Resolve relative paths to absolute paths
       // Handle ~ expansion
@@ -31,12 +68,12 @@ export class OpenAILogger {
       if (customLogDir === '~' || customLogDir.startsWith('~/')) {
         resolvedPath = path.join(os.homedir(), customLogDir.slice(1));
       } else if (!path.isAbsolute(customLogDir)) {
-        // If it's a relative path, resolve it relative to current working directory
-        resolvedPath = path.resolve(process.cwd(), customLogDir);
+        // If it's a relative path, resolve it relative to provided working directory
+        resolvedPath = path.resolve(baseCwd, customLogDir);
       }
       this.logDir = path.normalize(resolvedPath);
     } else {
-      this.logDir = path.join(process.cwd(), 'logs', 'openai');
+      this.logDir = path.join(baseCwd, 'logs', 'openai');
     }
   }
 
@@ -60,12 +97,15 @@ export class OpenAILogger {
    * @param request The request sent to OpenAI
    * @param response The response received from OpenAI
    * @param error Optional error if the request failed
+   * @param promptId Optional prompt id; internal and subagent prompt ids are
+   *                 appended to the filename after timestamp and id.
    * @returns The file path where the log was written
    */
   async logInteraction(
     request: unknown,
     response?: unknown,
     error?: Error,
+    promptId?: string,
   ): Promise<string> {
     if (!this.initialized) {
       await this.initialize();
@@ -73,7 +113,10 @@ export class OpenAILogger {
 
     const timestamp = new Date().toISOString().replace(/:/g, '-');
     const id = uuidv4().slice(0, 8);
-    const filename = `openai-${timestamp}-${id}.json`;
+    const promptIdSuffix = promptIdSuffixForFilename(promptId);
+    const filename = promptIdSuffix
+      ? `openai-${timestamp}-${id}-${promptIdSuffix}.json`
+      : `openai-${timestamp}-${id}.json`;
     const filePath = path.join(this.logDir, filename);
 
     const logData = {

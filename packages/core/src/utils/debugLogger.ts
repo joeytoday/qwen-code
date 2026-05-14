@@ -5,9 +5,13 @@
  */
 
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import util from 'node:util';
+import { trace } from '@opentelemetry/api';
 import { Storage } from '../config/storage.js';
+import { updateSymlink } from './symlink.js';
+import { getSessionContext } from '../telemetry/session-context.js';
 
 type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 
@@ -23,9 +27,15 @@ export interface DebugLogger {
 }
 
 let ensureDebugDirPromise: Promise<void> | null = null;
+let ensuredDebugDirPath: string | null = null;
 let hasWriteFailure = false;
 let globalSession: DebugLogSession | null = null;
 const sessionContext = new AsyncLocalStorage<DebugLogSession>();
+
+interface TraceContext {
+  traceId: string;
+  spanId: string;
+}
 
 function isDebugLogFileEnabled(): boolean {
   const value = process.env['QWEN_DEBUG_LOG_FILE'];
@@ -39,13 +49,16 @@ function getActiveSession(): DebugLogSession | null {
 }
 
 function ensureDebugDirExists(): Promise<void> {
-  if (!ensureDebugDirPromise) {
+  const debugDirPath = Storage.getGlobalDebugDir();
+  if (!ensureDebugDirPromise || ensuredDebugDirPath !== debugDirPath) {
+    ensuredDebugDirPath = debugDirPath;
     ensureDebugDirPromise = fs
-      .mkdir(Storage.getGlobalDebugDir(), { recursive: true })
+      .mkdir(debugDirPath, { recursive: true })
       .then(() => undefined)
       .catch(() => {
         hasWriteFailure = true;
         ensureDebugDirPromise = null;
+        ensuredDebugDirPath = null;
       });
   }
   return ensureDebugDirPromise ?? Promise.resolve();
@@ -63,17 +76,59 @@ function formatArgs(args: unknown[]): string {
     .join(' ');
 }
 
+const ZERO_TRACE_ID = '00000000000000000000000000000000';
+
+function getActiveSpanTraceContext(): TraceContext | null {
+  try {
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      const ctx = activeSpan.spanContext();
+      if (ctx.traceId !== ZERO_TRACE_ID) {
+        return { traceId: ctx.traceId, spanId: ctx.spanId };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function getSessionRootTraceContext(): TraceContext | null {
+  try {
+    const sessionContext = getSessionContext();
+    const sessionSpan = sessionContext ? trace.getSpan(sessionContext) : null;
+    const ctx = sessionSpan?.spanContext();
+    if (ctx && ctx.traceId !== ZERO_TRACE_ID) {
+      return { traceId: ctx.traceId, spanId: ctx.spanId };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function getTraceContext(): TraceContext | null {
+  return getActiveSpanTraceContext() ?? getSessionRootTraceContext();
+}
+
 /**
  * Builds a log line in the format:
- * `2026-01-23T06:58:02.011Z [DEBUG] [TAG] message`
+ * `2026-01-23T06:58:02.011Z [DEBUG] [TAG] [trace_id=xxx span_id=yyy] message`
  *
- * Tag is optional. If not provided, format is:
- * `2026-01-23T06:58:02.011Z [DEBUG] message`
+ * Tag and trace context are optional.
  */
-function buildLogLine(level: LogLevel, message: string, tag?: string): string {
+function buildLogLine(
+  level: LogLevel,
+  message: string,
+  tag?: string,
+  traceCtx?: TraceContext | null,
+): string {
   const timestamp = new Date().toISOString();
   const tagPart = tag ? ` [${tag}]` : '';
-  return `${timestamp} [${level}]${tagPart} ${message}\n`;
+  const tracePart = traceCtx
+    ? ` [trace_id=${traceCtx.traceId} span_id=${traceCtx.spanId}]`
+    : '';
+  return `${timestamp} [${level}]${tagPart}${tracePart} ${message}\n`;
 }
 
 function writeLog(
@@ -89,7 +144,8 @@ function writeLog(
   const sessionId = session.getSessionId();
   const logFilePath = Storage.getDebugLogPath(sessionId);
   const message = formatArgs(args);
-  const line = buildLogLine(level, message, tag);
+  const traceCtx = getTraceContext();
+  const line = buildLogLine(level, message, tag, traceCtx);
 
   void ensureDebugDirExists()
     .then(() => fs.appendFile(logFilePath, line, 'utf8'))
@@ -113,6 +169,24 @@ export function isDebugLoggingDegraded(): boolean {
 export function resetDebugLoggingState(): void {
   hasWriteFailure = false;
   ensureDebugDirPromise = null;
+  ensuredDebugDirPath = null;
+}
+
+const DEBUG_LATEST_ALIAS = 'latest';
+
+function updateLatestDebugLogAlias(sessionId: string): void {
+  if (!isDebugLogFileEnabled()) {
+    return;
+  }
+
+  const aliasPath = path.join(Storage.getGlobalDebugDir(), DEBUG_LATEST_ALIAS);
+  const targetPath = Storage.getDebugLogPath(sessionId);
+
+  void ensureDebugDirExists()
+    .then(() => updateSymlink(aliasPath, targetPath, { fallbackCopy: false }))
+    .catch(() => {
+      // Best-effort; don't degrade overall logging
+    });
 }
 
 /**
@@ -125,6 +199,9 @@ export function setDebugLogSession(
   session: DebugLogSession | null | undefined,
 ) {
   globalSession = session ?? null;
+  if (session) {
+    updateLatestDebugLogAlias(session.getSessionId());
+  }
 }
 
 /**

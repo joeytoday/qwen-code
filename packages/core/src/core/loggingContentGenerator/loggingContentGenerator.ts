@@ -21,6 +21,13 @@ import {
 } from '@google/genai';
 import type OpenAI from 'openai';
 import {
+  SpanStatusCode,
+  context,
+  trace,
+  type Context,
+  type Span,
+} from '@opentelemetry/api';
+import {
   ApiRequestEvent,
   ApiResponseEvent,
   ApiErrorEvent,
@@ -31,17 +38,36 @@ import {
   logApiRequest,
   logApiResponse,
 } from '../../telemetry/loggers.js';
+import { isInternalPromptId } from '../../utils/internalPromptIds.js';
+import { subagentNameContext } from '../../utils/subagentNameContext.js';
 import type {
   ContentGenerator,
   ContentGeneratorConfig,
+  InputModalities,
 } from '../contentGenerator.js';
-import { isStructuredError } from '../../utils/quotaErrorDetection.js';
 import { OpenAIContentConverter } from '../openaiContentGenerator/converter.js';
+import { openaiRequestCaptureContext } from '../openaiContentGenerator/requestCaptureContext.js';
+import type { RequestContext } from '../openaiContentGenerator/types.js';
 import { OpenAILogger } from '../../utils/openaiLogger.js';
+import { createDebugLogger } from '../../utils/debugLogger.js';
+import {
+  getErrorMessage,
+  getErrorStatus,
+  getErrorType,
+} from '../../utils/errors.js';
+import {
+  API_CALL_FAILED_SPAN_STATUS_MESSAGE,
+  safeSetStatus,
+  startSpanWithContext,
+  withSpan,
+} from '../../telemetry/tracer.js';
 
-interface StructuredError {
-  status: number;
-}
+const debugLogger = createDebugLogger('LOGGING_CONTENT_GENERATOR');
+
+const MAX_RESPONSE_TEXT_LENGTH = 4096;
+const RESPONSE_TEXT_TRUNCATION_SUFFIX = '...[truncated]';
+const MAX_RESPONSE_TEXT_PREFIX_LENGTH =
+  MAX_RESPONSE_TEXT_LENGTH - RESPONSE_TEXT_TRUNCATION_SUFFIX.length;
 
 /**
  * A decorator that wraps a ContentGenerator to add logging to API calls.
@@ -49,16 +75,22 @@ interface StructuredError {
 export class LoggingContentGenerator implements ContentGenerator {
   private openaiLogger?: OpenAILogger;
   private schemaCompliance?: 'auto' | 'openapi_30';
+  private modalities?: InputModalities;
 
   constructor(
     private readonly wrapped: ContentGenerator,
     private readonly config: Config,
     generatorConfig: ContentGeneratorConfig,
   ) {
+    this.modalities = generatorConfig.modalities;
+
     // Extract fields needed for initialization from passed config
     // (config.getContentGeneratorConfig() may not be available yet during refreshAuth)
     if (generatorConfig.enableOpenAILogging) {
-      this.openaiLogger = new OpenAILogger(generatorConfig.openAILoggingDir);
+      this.openaiLogger = new OpenAILogger(
+        generatorConfig.openAILoggingDir,
+        config.getWorkingDir(),
+      );
       this.schemaCompliance = generatorConfig.schemaCompliance;
     }
   }
@@ -75,7 +107,12 @@ export class LoggingContentGenerator implements ContentGenerator {
     const requestText = JSON.stringify(contents);
     logApiRequest(
       this.config,
-      new ApiRequestEvent(model, promptId, requestText),
+      new ApiRequestEvent(
+        model,
+        promptId,
+        requestText,
+        subagentNameContext.getStore(),
+      ),
     );
   }
 
@@ -97,6 +134,7 @@ export class LoggingContentGenerator implements ContentGenerator {
         this.config.getAuthType(),
         usageMetadata,
         responseText,
+        subagentNameContext.getStore(),
       ),
     );
   }
@@ -108,89 +146,240 @@ export class LoggingContentGenerator implements ContentGenerator {
     model: string,
     prompt_id: string,
   ): void {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const errorType =
-      (error as { type?: string })?.type ||
-      (error instanceof Error ? error.name : 'unknown');
+    const errorMessage = getErrorMessage(error);
+    const errorType = getErrorType(error);
     const errorResponseId =
       (error as { requestID?: string; request_id?: string })?.requestID ||
       (error as { requestID?: string; request_id?: string })?.request_id ||
       responseId;
-    const errorStatus =
-      (error as { code?: string | number; status?: number })?.code ??
-      (error as { status?: number })?.status ??
-      (isStructuredError(error)
-        ? (error as StructuredError).status
-        : undefined);
+    const errorStatus = getErrorStatus(error);
 
     logApiError(
       this.config,
-      new ApiErrorEvent(
-        errorResponseId,
+      new ApiErrorEvent({
+        responseId: errorResponseId,
         model,
-        errorMessage,
         durationMs,
-        prompt_id,
-        this.config.getAuthType(),
+        promptId: prompt_id,
+        authType: this.config.getAuthType(),
+        errorMessage,
         errorType,
-        errorStatus,
-      ),
+        statusCode: errorStatus,
+        subagentName: subagentNameContext.getStore(),
+      }),
     );
+  }
+
+  private safelyLogApiError(
+    responseId: string | undefined,
+    durationMs: number,
+    error: unknown,
+    model: string,
+    prompt_id: string,
+  ): void {
+    try {
+      this._logApiError(responseId, durationMs, error, model, prompt_id);
+    } catch (loggingError) {
+      debugLogger.warn('Failed to log API error:', loggingError);
+    }
+  }
+
+  private safelyLogApiResponse(
+    responseId: string,
+    durationMs: number,
+    model: string,
+    prompt_id: string,
+    usageMetadata?: GenerateContentResponseUsageMetadata,
+    responseText?: string,
+  ): void {
+    try {
+      this._logApiResponse(
+        responseId,
+        durationMs,
+        model,
+        prompt_id,
+        usageMetadata,
+        responseText,
+      );
+    } catch (loggingError) {
+      debugLogger.warn('Failed to log API response:', loggingError);
+    }
   }
 
   async generateContent(
     req: GenerateContentParameters,
     userPromptId: string,
   ): Promise<GenerateContentResponse> {
-    const startTime = Date.now();
-    this.logApiRequest(this.toContents(req.contents), req.model, userPromptId);
-    const openaiRequest = await this.buildOpenAIRequestForLogging(req);
-    try {
-      const response = await this.wrapped.generateContent(req, userPromptId);
-      const durationMs = Date.now() - startTime;
-      this._logApiResponse(
-        response.responseId ?? '',
-        durationMs,
-        response.modelVersion || req.model,
-        userPromptId,
-        response.usageMetadata,
-        JSON.stringify(response),
-      );
-      await this.logOpenAIInteraction(openaiRequest, response);
-      return response;
-    } catch (error) {
-      const durationMs = Date.now() - startTime;
-      this._logApiError(undefined, durationMs, error, req.model, userPromptId);
-      await this.logOpenAIInteraction(openaiRequest, undefined, error);
-      throw error;
-    }
+    return withSpan(
+      'api.generateContent',
+      { model: req.model, prompt_id: userPromptId },
+      async (span) => {
+        const startTime = Date.now();
+        const isInternal = isInternalPromptId(userPromptId);
+        const session = this.startCaptureSession();
+        try {
+          if (!isInternal) {
+            this.logApiRequest(
+              this.toContents(req.contents),
+              req.model,
+              userPromptId,
+            );
+          }
+          const response = await session.wrap(() =>
+            this.wrapped.generateContent(req, userPromptId),
+          );
+          const durationMs = Date.now() - startTime;
+          const responseText = isInternal
+            ? undefined
+            : this.extractResponseText(response);
+          this.safelyLogApiResponse(
+            response.responseId ?? '',
+            durationMs,
+            response.modelVersion || req.model,
+            userPromptId,
+            response.usageMetadata,
+            responseText,
+          );
+          try {
+            await this.safelyLogOpenAIInteraction(
+              await session.resolve(req),
+              response,
+              undefined,
+              userPromptId,
+            );
+          } catch (loggingError) {
+            debugLogger.warn('Failed to log OpenAI interaction:', loggingError);
+          }
+          return response;
+        } catch (error) {
+          const durationMs = Date.now() - startTime;
+          this.safelyLogApiError(
+            '',
+            durationMs,
+            error,
+            req.model,
+            userPromptId,
+          );
+          try {
+            await this.safelyLogOpenAIInteraction(
+              await session.resolve(req),
+              undefined,
+              error,
+              userPromptId,
+            );
+          } catch (loggingError) {
+            debugLogger.warn('Failed to log OpenAI interaction:', loggingError);
+          }
+          safeSetStatus(span, {
+            code: SpanStatusCode.ERROR,
+            message: API_CALL_FAILED_SPAN_STATUS_MESSAGE,
+          });
+          throw error;
+        }
+      },
+    );
   }
 
   async generateContentStream(
     req: GenerateContentParameters,
     userPromptId: string,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
+    const { span, runInContext } = startSpanWithContext(
+      'api.generateContentStream',
+      { model: req.model, prompt_id: userPromptId },
+    );
+
+    // Capture the span context so the stream wrapper can activate it
+    // during iteration — not just during generator creation.
+    const spanContext = trace.setSpan(context.active(), span);
+
     const startTime = Date.now();
-    this.logApiRequest(this.toContents(req.contents), req.model, userPromptId);
-    const openaiRequest = await this.buildOpenAIRequestForLogging(req);
+    const isInternal = isInternalPromptId(userPromptId);
+    const session = this.startCaptureSession();
 
     let stream: AsyncGenerator<GenerateContentResponse>;
     try {
-      stream = await this.wrapped.generateContentStream(req, userPromptId);
+      stream = await runInContext(async () => {
+        if (!isInternal) {
+          this.logApiRequest(
+            this.toContents(req.contents),
+            req.model,
+            userPromptId,
+          );
+        }
+        return session.wrap(() =>
+          this.wrapped.generateContentStream(req, userPromptId),
+        );
+      });
     } catch (error) {
+      safeSetStatus(span, {
+        code: SpanStatusCode.ERROR,
+        message: API_CALL_FAILED_SPAN_STATUS_MESSAGE,
+      });
       const durationMs = Date.now() - startTime;
-      this._logApiError(undefined, durationMs, error, req.model, userPromptId);
-      await this.logOpenAIInteraction(openaiRequest, undefined, error);
+      runInContext(() =>
+        this.safelyLogApiError('', durationMs, error, req.model, userPromptId),
+      );
+      try {
+        span.end();
+      } catch {
+        // OTel errors must not mask the original API error
+      }
+      try {
+        await this.safelyLogOpenAIInteraction(
+          await session.resolve(req),
+          undefined,
+          error,
+          userPromptId,
+        );
+      } catch (loggingError) {
+        debugLogger.warn('Failed to log OpenAI interaction:', loggingError);
+      }
       throw error;
     }
 
-    return this.loggingStreamWrapper(
-      stream,
-      startTime,
-      userPromptId,
-      req.model,
-      openaiRequest,
+    let resolvedRequest: OpenAI.Chat.ChatCompletionCreateParams | undefined;
+    if (this.openaiLogger) {
+      try {
+        resolvedRequest = await session.resolve(req);
+      } catch (loggingError) {
+        debugLogger.warn('Failed to resolve OpenAI request:', loggingError);
+      }
+    }
+
+    return runInContext(() =>
+      this.loggingStreamWrapper(
+        stream,
+        startTime,
+        userPromptId,
+        req.model,
+        resolvedRequest,
+        span,
+        spanContext,
+      ),
     );
+  }
+
+  private startCaptureSession(): {
+    wrap: <T>(fn: () => Promise<T>) => Promise<T>;
+    resolve: (
+      req: GenerateContentParameters,
+    ) => Promise<OpenAI.Chat.ChatCompletionCreateParams | undefined>;
+  } {
+    let captured: OpenAI.Chat.ChatCompletionCreateParams | undefined;
+    const skipCapture = !this.openaiLogger;
+    return {
+      wrap: <T>(fn: () => Promise<T>): Promise<T> =>
+        skipCapture
+          ? fn()
+          : openaiRequestCaptureContext.run((built) => {
+              captured = built;
+            }, fn),
+      resolve: async (req) =>
+        this.openaiLogger
+          ? (captured ?? (await this.buildOpenAIRequestForLogging(req)))
+          : undefined,
+    };
   }
 
   private async *loggingStreamWrapper(
@@ -199,42 +388,150 @@ export class LoggingContentGenerator implements ContentGenerator {
     userPromptId: string,
     model: string,
     openaiRequest?: OpenAI.Chat.ChatCompletionCreateParams,
+    span?: Span,
+    spanContext?: Context,
   ): AsyncGenerator<GenerateContentResponse> {
+    const isInternal = isInternalPromptId(userPromptId);
+    // Skip collecting full responses for internal prompts to avoid memory
+    // overhead, unless OpenAI file logging needs them.
+    const shouldCollectResponses = !isInternal || !!this.openaiLogger;
     const responses: GenerateContentResponse[] = [];
 
+    // Track first-seen IDs so _logApiResponse/_logApiError have accurate
+    // values even when we skip collecting full responses for internal prompts.
+    let firstResponseId = '';
+    let firstModelVersion = '';
     let lastUsageMetadata: GenerateContentResponseUsageMetadata | undefined;
+    let terminalStatusAttempted = false;
+    let spanEnded = false;
+
+    // Helper to run code within the span context during iteration.
+    // This ensures debug log lines emitted during stream processing
+    // see the stream span as the active span.
+    const runInSpan = <T>(fn: () => T): T =>
+      spanContext ? context.with(spanContext, fn) : fn();
+
+    // Idle timeout: if no chunks arrive for this duration the consumer has
+    // likely abandoned the generator without calling .return(). Close the
+    // span so it doesn't leak forever.  The timer resets on every chunk,
+    // so legitimately long-running streams are never affected.
+    const STREAM_IDLE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+    let spanEndTimeout: ReturnType<typeof setTimeout> | undefined;
+    const resetSpanTimeout = span
+      ? () => {
+          if (spanEnded) return;
+          if (spanEndTimeout !== undefined) clearTimeout(spanEndTimeout);
+          spanEndTimeout = setTimeout(() => {
+            try {
+              safeSetStatus(span, {
+                code: SpanStatusCode.ERROR,
+                message: 'Stream span timed out (idle)',
+              });
+              spanEnded = true;
+              span.setAttribute('stream.timed_out', true);
+              span.end();
+            } catch {
+              // OTel errors must not interrupt the consumer.
+            }
+          }, STREAM_IDLE_TIMEOUT_MS);
+          spanEndTimeout.unref();
+        }
+      : undefined;
+    resetSpanTimeout?.();
+
     try {
       for await (const response of stream) {
-        responses.push(response);
+        if (!firstResponseId && response.responseId) {
+          firstResponseId = response.responseId;
+        }
+        if (!firstModelVersion && response.modelVersion) {
+          firstModelVersion = response.modelVersion;
+        }
+        if (shouldCollectResponses) {
+          responses.push(response);
+        }
         if (response.usageMetadata) {
           lastUsageMetadata = response.usageMetadata;
         }
+        resetSpanTimeout?.();
         yield response;
+      }
+      if (spanEndTimeout !== undefined) {
+        clearTimeout(spanEndTimeout);
+        spanEndTimeout = undefined;
       }
       // Only log successful API response if no error occurred
       const durationMs = Date.now() - startTime;
-      this._logApiResponse(
-        responses[0]?.responseId ?? '',
-        durationMs,
-        responses[0]?.modelVersion || model,
-        userPromptId,
-        lastUsageMetadata,
-        JSON.stringify(responses),
+      const consolidatedResponse = shouldCollectResponses
+        ? this.consolidateGeminiResponsesForLogging(responses)
+        : undefined;
+      runInSpan(() =>
+        this.safelyLogApiResponse(
+          firstResponseId,
+          durationMs,
+          firstModelVersion || model,
+          userPromptId,
+          lastUsageMetadata,
+          isInternal
+            ? undefined
+            : this.extractResponseText(consolidatedResponse),
+        ),
       );
-      const consolidatedResponse =
-        this.consolidateGeminiResponsesForLogging(responses);
-      await this.logOpenAIInteraction(openaiRequest, consolidatedResponse);
+      await runInSpan(() =>
+        this.safelyLogOpenAIInteraction(
+          openaiRequest,
+          consolidatedResponse,
+          undefined,
+          userPromptId,
+        ),
+      );
+      terminalStatusAttempted = true;
+      if (span) {
+        safeSetStatus(span, { code: SpanStatusCode.OK });
+      }
     } catch (error) {
       const durationMs = Date.now() - startTime;
-      this._logApiError(
-        undefined,
-        durationMs,
-        error,
-        responses[0]?.modelVersion || model,
-        userPromptId,
+      runInSpan(() =>
+        this.safelyLogApiError(
+          firstResponseId,
+          durationMs,
+          error,
+          firstModelVersion || model,
+          userPromptId,
+        ),
       );
-      await this.logOpenAIInteraction(openaiRequest, undefined, error);
+      await runInSpan(() =>
+        this.safelyLogOpenAIInteraction(
+          openaiRequest,
+          undefined,
+          error,
+          userPromptId,
+        ),
+      );
+      terminalStatusAttempted = true;
+      if (span) {
+        safeSetStatus(span, {
+          code: SpanStatusCode.ERROR,
+          message: API_CALL_FAILED_SPAN_STATUS_MESSAGE,
+        });
+      }
       throw error;
+    } finally {
+      if (spanEndTimeout !== undefined) {
+        clearTimeout(spanEndTimeout);
+      }
+      if (!spanEnded) {
+        if (!terminalStatusAttempted) {
+          if (span) {
+            safeSetStatus(span, { code: SpanStatusCode.OK });
+          }
+        }
+        try {
+          span?.end();
+        } catch {
+          // OTel errors must not mask the original API error
+        }
+      }
     }
   }
 
@@ -245,13 +542,14 @@ export class LoggingContentGenerator implements ContentGenerator {
       return undefined;
     }
 
-    const converter = new OpenAIContentConverter(
-      request.model,
-      this.schemaCompliance,
+    const requestContext = this.createLoggingRequestContext(request.model);
+    const messages = OpenAIContentConverter.convertGeminiRequestToOpenAI(
+      request,
+      requestContext,
+      {
+        cleanOrphanToolCalls: false,
+      },
     );
-    const messages = converter.convertGeminiRequestToOpenAI(request, {
-      cleanOrphanToolCalls: false,
-    });
 
     const openaiRequest: OpenAI.Chat.ChatCompletionCreateParams = {
       model: request.model,
@@ -259,9 +557,11 @@ export class LoggingContentGenerator implements ContentGenerator {
     };
 
     if (request.config?.tools) {
-      openaiRequest.tools = await converter.convertGeminiToolsToOpenAI(
-        request.config.tools,
-      );
+      openaiRequest.tools =
+        await OpenAIContentConverter.convertGeminiToolsToOpenAI(
+          request.config.tools,
+          this.schemaCompliance ?? 'auto',
+        );
     }
 
     if (request.config?.temperature !== undefined) {
@@ -283,10 +583,19 @@ export class LoggingContentGenerator implements ContentGenerator {
     return openaiRequest;
   }
 
+  private createLoggingRequestContext(model: string): RequestContext {
+    return {
+      model,
+      modalities: this.modalities ?? {},
+      startTime: 0,
+    };
+  }
+
   private async logOpenAIInteraction(
     openaiRequest: OpenAI.Chat.ChatCompletionCreateParams | undefined,
     response?: GenerateContentResponse,
     error?: unknown,
+    promptId?: string,
   ): Promise<void> {
     if (!this.openaiLogger || !openaiRequest) {
       return;
@@ -304,19 +613,31 @@ export class LoggingContentGenerator implements ContentGenerator {
         : error
           ? new Error(String(error))
           : undefined,
+      promptId,
     );
+  }
+
+  private async safelyLogOpenAIInteraction(
+    openaiRequest: OpenAI.Chat.ChatCompletionCreateParams | undefined,
+    response?: GenerateContentResponse,
+    error?: unknown,
+    promptId?: string,
+  ): Promise<void> {
+    try {
+      await this.logOpenAIInteraction(openaiRequest, response, error, promptId);
+    } catch (loggingError) {
+      debugLogger.warn('Failed to log OpenAI interaction:', loggingError);
+    }
   }
 
   private convertGeminiResponseToOpenAIForLogging(
     response: GenerateContentResponse,
     openaiRequest: OpenAI.Chat.ChatCompletionCreateParams,
   ): OpenAI.Chat.ChatCompletion {
-    const converter = new OpenAIContentConverter(
-      openaiRequest.model,
-      this.schemaCompliance,
+    return OpenAIContentConverter.convertGeminiResponseToOpenAI(
+      response,
+      this.createLoggingRequestContext(openaiRequest.model),
     );
-
-    return converter.convertGeminiResponseToOpenAI(response);
   }
 
   private consolidateGeminiResponsesForLogging(
@@ -407,6 +728,55 @@ export class LoggingContentGenerator implements ContentGenerator {
     ];
 
     return consolidated;
+  }
+
+  private extractResponseText(
+    response: GenerateContentResponse | undefined,
+  ): string | undefined {
+    const parts = response?.candidates?.[0]?.content?.parts;
+    if (!parts?.length) {
+      return undefined;
+    }
+
+    let text = '';
+    let hasText = false;
+    let truncated = false;
+    const appendText = (partText: string) => {
+      hasText = true;
+      if (truncated) {
+        return;
+      }
+
+      const remaining = MAX_RESPONSE_TEXT_PREFIX_LENGTH - text.length;
+      if (partText.length <= remaining) {
+        text += partText;
+        return;
+      }
+
+      text += partText.slice(0, Math.max(0, remaining));
+      truncated = true;
+    };
+
+    for (const part of parts as Part[]) {
+      if (typeof part === 'string') {
+        appendText(part);
+        continue;
+      }
+
+      if (
+        'text' in part &&
+        typeof part.text === 'string' &&
+        !('thought' in part && part.thought)
+      ) {
+        appendText(part.text);
+      }
+    }
+
+    if (!hasText) {
+      return undefined;
+    }
+
+    return truncated ? `${text}${RESPONSE_TEXT_TRUNCATION_SUFFIX}` : text;
   }
 
   async countTokens(req: CountTokensParameters): Promise<CountTokensResponse> {

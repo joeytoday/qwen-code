@@ -7,45 +7,79 @@ import {
   DEFAULT_TIMEOUT,
   DEFAULT_MAX_RETRIES,
   DEFAULT_DASHSCOPE_BASE_URL,
+  DASHSCOPE_PROXY_BASE_URL,
 } from '../constants.js';
 import type {
-  OpenAICompatibleProvider,
   DashScopeRequestMetadata,
   ChatCompletionContentPartTextWithCache,
   ChatCompletionContentPartWithCache,
   ChatCompletionToolWithCache,
 } from './types.js';
 import { buildRuntimeFetchOptions } from '../../../utils/runtimeFetchOptions.js';
-import { tokenLimit } from '../../tokenLimits.js';
+import { createDebugLogger } from '../../../utils/debugLogger.js';
+import { DefaultOpenAICompatibleProvider } from './default.js';
 
-export class DashScopeOpenAICompatibleProvider
-  implements OpenAICompatibleProvider
-{
-  private contentGeneratorConfig: ContentGeneratorConfig;
-  private cliConfig: Config;
+const debugLogger = createDebugLogger('DashScopeOpenAICompatibleProvider');
 
+export class DashScopeOpenAICompatibleProvider extends DefaultOpenAICompatibleProvider {
   constructor(
     contentGeneratorConfig: ContentGeneratorConfig,
     cliConfig: Config,
   ) {
-    this.cliConfig = cliConfig;
-    this.contentGeneratorConfig = contentGeneratorConfig;
+    super(contentGeneratorConfig, cliConfig);
   }
 
   static isDashScopeProvider(
     contentGeneratorConfig: ContentGeneratorConfig,
   ): boolean {
-    const authType = contentGeneratorConfig.authType;
-    const baseUrl = contentGeneratorConfig.baseUrl;
-    return (
-      authType === AuthType.QWEN_OAUTH ||
-      baseUrl === 'https://dashscope.aliyuncs.com/compatible-mode/v1' ||
-      baseUrl === 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' ||
-      !baseUrl
+    const { authType, baseUrl } = contentGeneratorConfig;
+
+    if (authType === AuthType.QWEN_OAUTH) return true;
+    if (!baseUrl) return true;
+
+    const normalizedBaseUrl = baseUrl.endsWith('/')
+      ? baseUrl.slice(0, -1)
+      : baseUrl;
+
+    // Parse the URL and check hostname instead of regex to avoid ReDoS on
+    // attacker-controlled baseUrl and to reject path-only matches like
+    // https://evil.example/dashscope.aliyuncs.com/...
+    let hostname: string | null = null;
+    try {
+      hostname = new URL(normalizedBaseUrl).hostname.toLowerCase();
+    } catch {
+      hostname = null;
+    }
+
+    // Matches: dashscope.aliyuncs.com, *.dashscope.aliyuncs.com,
+    // dashscope-intl.aliyuncs.com, or *.dashscope-intl.aliyuncs.com
+    const isDashscopeOrigin =
+      hostname !== null &&
+      (hostname === 'dashscope.aliyuncs.com' ||
+        hostname === 'dashscope-intl.aliyuncs.com' ||
+        hostname.endsWith('.dashscope.aliyuncs.com') ||
+        hostname.endsWith('.dashscope-intl.aliyuncs.com'));
+
+    // Check if proxy is configured and matches
+    const normalizedProxyUrl = DASHSCOPE_PROXY_BASE_URL?.endsWith('/')
+      ? DASHSCOPE_PROXY_BASE_URL.slice(0, -1)
+      : DASHSCOPE_PROXY_BASE_URL;
+
+    const isProxyMatch = Boolean(
+      normalizedProxyUrl &&
+        normalizedBaseUrl.toLowerCase() === normalizedProxyUrl.toLowerCase(),
     );
+
+    if (normalizedProxyUrl && !isDashscopeOrigin && !isProxyMatch) {
+      debugLogger.debug(
+        `DASHSCOPE_PROXY_BASE_URL is configured but the request baseUrl does not match. DashScope headers/cache control will be skipped.`,
+      );
+    }
+
+    return isDashscopeOrigin || isProxyMatch;
   }
 
-  buildHeaders(): Record<string, string | undefined> {
+  override buildHeaders(): Record<string, string | undefined> {
     const version = this.cliConfig.getCliVersion() || 'unknown';
     const userAgent = `QwenCode/${version} (${process.platform}; ${process.arch})`;
     const { authType, customHeaders } = this.contentGeneratorConfig;
@@ -61,7 +95,7 @@ export class DashScopeOpenAICompatibleProvider
       : defaultHeaders;
   }
 
-  buildClient(): OpenAI {
+  override buildClient(): OpenAI {
     const {
       apiKey,
       baseUrl = DEFAULT_DASHSCOPE_BASE_URL,
@@ -69,8 +103,9 @@ export class DashScopeOpenAICompatibleProvider
       maxRetries = DEFAULT_MAX_RETRIES,
     } = this.contentGeneratorConfig;
     const defaultHeaders = this.buildHeaders();
-    // Configure fetch options to ensure user-configured timeout works as expected
-    // bodyTimeout is always disabled (0) to let OpenAI SDK timeout control the request
+    // Configure fetch options for proxy support and timeout handling.
+    // With proxy, dispatcher timeouts are disabled so SDK timeout controls the
+    // request; without proxy, no custom dispatcher is installed.
     const runtimeOptions = buildRuntimeFetchOptions(
       'openai',
       this.cliConfig.getProxy(),
@@ -99,7 +134,7 @@ export class DashScopeOpenAICompatibleProvider
    * @param userPromptId - Unique identifier for the user prompt for session tracking
    * @returns Configured request with DashScope-specific parameters applied
    */
-  buildRequest(
+  override buildRequest(
     request: OpenAI.Chat.ChatCompletionCreateParams,
     userPromptId: string,
   ): OpenAI.Chat.ChatCompletionCreateParams {
@@ -117,8 +152,9 @@ export class DashScopeOpenAICompatibleProvider
       tools = updatedTools;
     }
 
-    // Apply output token limits based on model capabilities
-    // This ensures max_tokens doesn't exceed the model's maximum output limit
+    // Apply output token limits using parent class logic
+    // Uses capped default (min of model limit and CAPPED_DEFAULT_MAX_TOKENS=8K)
+    // Requests hitting the cap get one clean retry at 64K (geminiChat.ts)
     const requestWithTokenLimits = this.applyOutputTokenLimit(request);
 
     const extraBody = this.contentGeneratorConfig.extra_body;
@@ -156,10 +192,8 @@ export class DashScopeOpenAICompatibleProvider
     };
   }
 
-  getDefaultGenerationConfig(): GenerateContentConfig {
-    return {
-      temperature: 0.3,
-    };
+  override getDefaultGenerationConfig(): GenerateContentConfig {
+    return {};
   }
 
   /**
@@ -279,6 +313,18 @@ export class DashScopeOpenAICompatibleProvider
     return contentArray;
   }
 
+  /**
+   * Vision-capable model patterns.
+   * Supports exact matches and prefix patterns for easy extension.
+   */
+  private static readonly VISION_MODEL_EXACT_MATCHES = new Set(['coder-model']);
+
+  private static readonly VISION_MODEL_PREFIX_PATTERNS = [
+    'qwen-vl', // qwen-vl-max, qwen-vl-max-latest, etc.
+    'qwen3-vl-plus', // qwen3-vl-plus variants
+    'qwen3.5-plus', // qwen3.5-plus (has built-in vision capabilities)
+  ];
+
   private isVisionModel(model: string | undefined): boolean {
     if (!model) {
       return false;
@@ -286,54 +332,23 @@ export class DashScopeOpenAICompatibleProvider
 
     const normalized = model.toLowerCase();
 
-    if (normalized === 'vision-model') {
+    // Check exact matches
+    if (
+      DashScopeOpenAICompatibleProvider.VISION_MODEL_EXACT_MATCHES.has(
+        normalized,
+      )
+    ) {
       return true;
     }
 
-    if (normalized.startsWith('qwen-vl')) {
-      return true;
-    }
-
-    if (normalized.startsWith('qwen3-vl-plus')) {
-      return true;
+    // Check prefix patterns
+    for (const prefix of DashScopeOpenAICompatibleProvider.VISION_MODEL_PREFIX_PATTERNS) {
+      if (normalized.startsWith(prefix)) {
+        return true;
+      }
     }
 
     return false;
-  }
-
-  /**
-   * Apply output token limit to a request's max_tokens parameter.
-   *
-   * Ensures that existing max_tokens parameters don't exceed the model's maximum output
-   * token limit. Only modifies max_tokens when already present in the request.
-   *
-   * @param request - The chat completion request parameters
-   * @returns The request with max_tokens adjusted to respect the model's limits (if present)
-   */
-  private applyOutputTokenLimit<
-    T extends { max_tokens?: number | null; model: string },
-  >(request: T): T {
-    const currentMaxTokens = request.max_tokens;
-
-    // Only process if max_tokens is already present in the request
-    if (currentMaxTokens === undefined || currentMaxTokens === null) {
-      return request; // No max_tokens parameter, return unchanged
-    }
-
-    // Dynamically calculate output token limit using tokenLimit function
-    // This ensures we always use the latest model-specific limits without relying on user configuration
-    const modelLimit = tokenLimit(request.model, 'output');
-
-    // If max_tokens exceeds the model limit, cap it to the model's limit
-    if (currentMaxTokens > modelLimit) {
-      return {
-        ...request,
-        max_tokens: modelLimit,
-      };
-    }
-
-    // If max_tokens is within the limit, return the request unchanged
-    return request;
   }
 
   /**

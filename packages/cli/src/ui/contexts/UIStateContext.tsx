@@ -7,6 +7,7 @@
 import { createContext, useContext } from 'react';
 import type {
   HistoryItem,
+  HistoryItemBtw,
   ThoughtSummary,
   ShellConfirmationRequest,
   ConfirmationRequest,
@@ -16,14 +17,16 @@ import type {
   SettingInputRequest,
   PluginChoiceRequest,
 } from '../types.js';
-import type { QwenAuthState } from '../hooks/useQwenAuth.js';
+import type { TodoItem } from '../components/TodoDisplay.js';
+import type { AuthUiState } from '../auth/useAuth.js';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
+import type { RecentSlashCommands } from '../hooks/useSlashCompletion.js';
 import type { TextBuffer } from '../components/shared/text-buffer.js';
 import type {
-  AuthType,
   IdeContext,
   ApprovalMode,
   IdeInfo,
+  SessionListItem,
 } from '@qwen-code/qwen-code-core';
 import type { DOMElement } from 'ink';
 import type { SessionStatsState } from '../contexts/SessionContext.js';
@@ -31,35 +34,44 @@ import type { ExtensionUpdateState } from '../state/extensions.js';
 import type { UpdateObject } from '../utils/updateCheck.js';
 
 import { type UseHistoryManagerReturn } from '../hooks/useHistoryManager.js';
+import { type HelpTab } from './UIActionsContext.js';
 import { type RestartReason } from '../hooks/useIdeTrustListener.js';
+import { type ProviderUpdateRequest } from '../hooks/useProviderUpdates.js';
+import { type ArenaDialogType } from '../hooks/useArenaCommand.js';
 
 export interface UIState {
   history: HistoryItem[];
   historyManager: UseHistoryManagerReturn;
   isThemeDialogOpen: boolean;
   themeError: string | null;
-  isAuthenticating: boolean;
+  auth: AuthUiState;
   isConfigInitialized: boolean;
-  authError: string | null;
-  isAuthDialogOpen: boolean;
-  pendingAuthType: AuthType | undefined;
-  // Qwen OAuth state
-  qwenAuthState: QwenAuthState;
   editorError: string | null;
   isEditorDialogOpen: boolean;
   debugMessage: string;
   quittingMessages: HistoryItem[] | null;
   isSettingsDialogOpen: boolean;
+  isMemoryDialogOpen: boolean;
   isModelDialogOpen: boolean;
+  isFastModelMode: boolean;
+  isManageModelsDialogOpen: boolean;
+  isTrustDialogOpen: boolean;
+  activeArenaDialog: ArenaDialogType;
   isPermissionsDialogOpen: boolean;
   isApprovalModeDialogOpen: boolean;
   isResumeDialogOpen: boolean;
+  resumeMatchedSessions: SessionListItem[] | undefined;
+  isDeleteDialogOpen: boolean;
+  isHelpDialogOpen: boolean;
+  activeHelpTab: HelpTab;
   slashCommands: readonly SlashCommand[];
+  recentSlashCommands: RecentSlashCommands;
   pendingSlashCommandHistoryItems: HistoryItemWithoutId[];
   commandContext: CommandContext;
   shellConfirmationRequest: ShellConfirmationRequest | null;
   confirmationRequest: ConfirmationRequest | null;
   confirmUpdateExtensionRequests: ConfirmationRequest[];
+  providerUpdateRequest: ProviderUpdateRequest | undefined;
   settingInputRequests: SettingInputRequest[];
   pluginChoiceRequests: PluginChoiceRequest[];
   loopDetectionConfirmationRequest: LoopDetectionConfirmationRequest | null;
@@ -99,6 +111,10 @@ export interface UIState {
   staticExtraHeight: number;
   dialogsVisible: boolean;
   pendingHistoryItems: HistoryItemWithoutId[];
+  stickyTodos: TodoItem[] | null;
+  btwItem: HistoryItemBtw | null;
+  setBtwItem: (item: HistoryItemBtw | null) => void;
+  cancelBtw: () => void;
   nightly: boolean;
   branchName: string | undefined;
   sessionStats: SessionStatsState;
@@ -113,8 +129,6 @@ export interface UIState {
   extensionsUpdateState: Map<string, ExtensionUpdateState>;
   activePtyId: number | undefined;
   embeddedShellFocused: boolean;
-  // Vision switch dialog
-  isVisionSwitchDialogOpen: boolean;
   // Welcome back dialog
   showWelcomeBackDialog: boolean;
   welcomeBackInfo: {
@@ -125,8 +139,30 @@ export interface UIState {
   // Subagent dialogs
   isSubagentCreateDialogOpen: boolean;
   isAgentsManagerDialogOpen: boolean;
+  // Extensions manager dialog
+  isExtensionsManagerDialogOpen: boolean;
+  // MCP dialog
+  isMcpDialogOpen: boolean;
+  // Hooks dialog
+  isHooksDialogOpen: boolean;
   // Feedback dialog
   isFeedbackDialogOpen: boolean;
+  // Per-task token tracking
+  taskStartTokens: number;
+  // Real-time token display: ref to streaming output char length (polled, not state)
+  streamingResponseLengthRef: React.RefObject<number>;
+  // True = receiving content (↓), false = waiting for API response (↑)
+  isReceivingContent: boolean;
+  // Session custom name (set via /rename)
+  sessionName: string | null;
+  setSessionName: (name: string | null) => void;
+  // Prompt suggestion
+  promptSuggestion: string | null;
+  /** Dismiss prompt suggestion (clears state, aborts speculation) */
+  dismissPromptSuggestion: () => void;
+  // Rewind selector
+  isRewindSelectorOpen: boolean;
+  rewindEscPending: boolean;
 }
 
 export const UIStateContext = createContext<UIState | null>(null);

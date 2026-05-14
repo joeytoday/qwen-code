@@ -11,13 +11,16 @@ export default {
     type: 'separator',
   },
   'sdk-typescript': 'Typescript SDK',
-  'sdk-java': 'Java SDK(alpha)',
+  'sdk-python': 'Python SDK (alpha)',
+  'sdk-java': 'Java SDK (alpha)',
   'Dive Into Qwen Code': {
     title: 'Dive Into Qwen Code',
     type: 'separator',
   },
 
+  'channel-plugins': 'Channel Plugin Guide',
   tools: 'Tools',
+  'qwen-serve-protocol': 'qwen serve HTTP protocol',
 
   examples: {
     display: 'hidden',

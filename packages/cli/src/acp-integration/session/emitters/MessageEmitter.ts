@@ -5,7 +5,8 @@
  */
 
 import type { GenerateContentResponseUsageMetadata } from '@google/genai';
-import type { Usage } from '../../schema.js';
+import type { SubagentMeta } from '../types.js';
+import type { Usage } from '@agentclientprotocol/sdk';
 import { BaseEmitter } from './BaseEmitter.js';
 
 /**
@@ -16,6 +17,31 @@ import { BaseEmitter } from './BaseEmitter.js';
  * normal flow, history replay, or other sources.
  */
 export class MessageEmitter extends BaseEmitter {
+  /**
+   * Emits a StopHookLoop event when Stop hooks create a loop.
+   * This informs the client that Stop hooks have been executed multiple times.
+   *
+   * @param iterationCount - The current iteration count
+   * @param reasons - Array of reasons from each Stop hook execution
+   * @param stopHookCount - Number of Stop hooks that were executed
+   */
+  async emitStopHookLoop(
+    iterationCount: number,
+    reasons: string[],
+    stopHookCount: number,
+  ): Promise<void> {
+    await this.sendUpdate({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '' },
+      _meta: {
+        stopHookLoop: {
+          iterationCount,
+          reasons,
+          stopHookCount,
+        },
+      },
+    });
+  }
   /**
    * Emits a user message chunk.
    *
@@ -77,14 +103,14 @@ export class MessageEmitter extends BaseEmitter {
     usageMetadata: GenerateContentResponseUsageMetadata,
     text: string = '',
     durationMs?: number,
-    subagentMeta?: import('../types.js').SubagentMeta,
+    subagentMeta?: SubagentMeta,
   ): Promise<void> {
     const usage: Usage = {
-      promptTokens: usageMetadata.promptTokenCount,
-      completionTokens: usageMetadata.candidatesTokenCount,
-      thoughtsTokens: usageMetadata.thoughtsTokenCount,
-      totalTokens: usageMetadata.totalTokenCount,
-      cachedTokens: usageMetadata.cachedContentTokenCount,
+      inputTokens: usageMetadata.promptTokenCount ?? 0,
+      outputTokens: usageMetadata.candidatesTokenCount ?? 0,
+      totalTokens: usageMetadata.totalTokenCount ?? 0,
+      thoughtTokens: usageMetadata.thoughtsTokenCount,
+      cachedReadTokens: usageMetadata.cachedContentTokenCount,
     };
 
     const meta =

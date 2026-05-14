@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'node:fs';
 import type {
   Settings,
   SettingScope,
@@ -126,6 +127,13 @@ export function getNestedValue(
     return getNestedValue(value as Record<string, unknown>, rest);
   }
   return undefined;
+}
+
+export function getNestedProperty(
+  obj: Record<string, unknown>,
+  path: string,
+): unknown {
+  return getNestedValue(obj, path.split('.'));
 }
 
 /**
@@ -287,7 +295,8 @@ const SETTINGS_DIALOG_ORDER: readonly string[] = [
   'ui.enableWelcomeBack',
 
   // Git Behavior
-  'general.gitCoAuthor',
+  'general.gitCoAuthor.commit',
+  'general.gitCoAuthor.pr',
 
   // File Filtering
   'context.fileFiltering.respectGitIgnore',
@@ -381,30 +390,69 @@ export function settingExistsInScope(
   return value !== undefined;
 }
 
-/**
- * Recursively sets a value in a nested object using a key path array.
- */
-function setNestedValue(
+export function setNestedPropertyForce(
   obj: Record<string, unknown>,
-  path: string[],
+  path: string,
   value: unknown,
-): Record<string, unknown> {
-  const [first, ...rest] = path;
-  if (!first) {
-    return obj;
+): void {
+  const keys = path.split('.');
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    if (!current[key] || typeof current[key] !== 'object') {
+      current[key] = {};
+    }
+    current = current[key] as Record<string, unknown>;
   }
 
-  if (rest.length === 0) {
-    obj[first] = value;
-    return obj;
+  current[lastKey] = value;
+}
+
+export function setNestedPropertySafe(
+  obj: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): void {
+  const keys = path.split('.');
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    if (current[key] === undefined) {
+      current[key] = {};
+    }
+    const next = current[key];
+    if (typeof next === 'object' && next !== null) {
+      current = next as Record<string, unknown>;
+    } else {
+      return;
+    }
   }
 
-  if (!obj[first] || typeof obj[first] !== 'object') {
-    obj[first] = {};
+  current[lastKey] = value;
+}
+
+export function deleteNestedPropertySafe(
+  obj: Record<string, unknown>,
+  path: string,
+): void {
+  const keys = path.split('.');
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    const next = current[key];
+    if (typeof next !== 'object' || next === null) {
+      return;
+    }
+    current = next as Record<string, unknown>;
   }
 
-  setNestedValue(obj[first] as Record<string, unknown>, rest, value);
-  return obj;
+  delete current[lastKey];
 }
 
 /**
@@ -415,9 +463,8 @@ export function setPendingSettingValue(
   value: boolean,
   pendingSettings: Settings,
 ): Settings {
-  const path = key.split('.');
   const newSettings = JSON.parse(JSON.stringify(pendingSettings));
-  setNestedValue(newSettings, path, value);
+  setNestedPropertyForce(newSettings, key, value);
   return newSettings;
 }
 
@@ -429,9 +476,8 @@ export function setPendingSettingValueAny(
   value: SettingsValue,
   pendingSettings: Settings,
 ): Settings {
-  const path = key.split('.');
   const newSettings = structuredClone(pendingSettings);
-  setNestedValue(newSettings, path, value);
+  setNestedPropertyForce(newSettings, key, value);
   return newSettings;
 }
 
@@ -575,6 +621,60 @@ export function getEffectiveDisplayValue(
   mergedSettings: Settings,
 ): boolean {
   return getSettingValue(key, settings, mergedSettings);
+}
+
+/**
+ * Backup a settings file before modification.
+ * Always creates a fresh backup with `.orig` suffix (overwrites any stale backup).
+ * @param filePath - Path to the settings file to backup
+ * @returns boolean indicating whether a backup was created
+ */
+export function backupSettingsFile(filePath: string): boolean {
+  try {
+    if (fs.existsSync(filePath)) {
+      const backupPath = `${filePath}.orig`;
+      fs.copyFileSync(filePath, backupPath);
+      return true;
+    }
+  } catch (_e) {
+    // Ignore backup errors, proceed without backup
+  }
+  return false;
+}
+
+/**
+ * Restore a settings file from its `.orig` backup created by {@link backupSettingsFile}.
+ * Removes the backup file after a successful restore.
+ * @param filePath - Path to the settings file to restore
+ * @returns boolean indicating whether the restore succeeded
+ */
+export function restoreSettingsFromBackup(filePath: string): boolean {
+  try {
+    const backupPath = `${filePath}.orig`;
+    if (fs.existsSync(backupPath)) {
+      fs.copyFileSync(backupPath, filePath);
+      fs.unlinkSync(backupPath);
+      return true;
+    }
+  } catch (_e) {
+    // Ignore restore errors — caller should handle the failure
+  }
+  return false;
+}
+
+/**
+ * Remove the `.orig` backup after a successful operation.
+ * @param filePath - Path to the settings file whose backup should be removed
+ */
+export function cleanupSettingsBackup(filePath: string): void {
+  try {
+    const backupPath = `${filePath}.orig`;
+    if (fs.existsSync(backupPath)) {
+      fs.unlinkSync(backupPath);
+    }
+  } catch (_e) {
+    // Ignore cleanup errors — non-critical
+  }
 }
 
 export const TEST_ONLY = { clearFlattenedSchema };

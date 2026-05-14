@@ -269,8 +269,11 @@ export function useVim(buffer: TextBuffer, onSubmit?: (value: string) => void) {
         return false; // Let InputPrompt handle completion
       }
 
-      // Let InputPrompt handle Ctrl+V for clipboard image pasting
-      if (normalizedKey.ctrl && normalizedKey.name === 'v') {
+      // Let InputPrompt handle Ctrl+V or Cmd+V for clipboard image pasting
+      if (
+        (normalizedKey.ctrl || normalizedKey.meta) &&
+        normalizedKey.name === 'v'
+      ) {
         return false; // Let InputPrompt handle clipboard functionality
       }
 
@@ -408,6 +411,17 @@ export function useVim(buffer: TextBuffer, onSubmit?: (value: string) => void) {
 
       // Handle NORMAL mode
       if (state.mode === 'NORMAL') {
+        // Let the documented shortcuts panel toggle handle plain `?` when the
+        // prompt is empty and vim is otherwise idle.
+        if (
+          normalizedKey.sequence === '?' &&
+          buffer.text.length === 0 &&
+          state.pendingOperator === null &&
+          state.count === 0
+        ) {
+          return false;
+        }
+
         // If in NORMAL mode, allow escape to pass through to other handlers
         // if there's no pending operation.
         if (normalizedKey.name === 'escape') {

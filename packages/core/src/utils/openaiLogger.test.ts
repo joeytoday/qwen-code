@@ -148,6 +148,99 @@ describe('OpenAILogger', () => {
       expect(fileExists).toBe(true);
     });
 
+    it('should include sanitized internal prompt id suffix when provided', async () => {
+      const logger = new OpenAILogger(testTempDir);
+      await logger.initialize();
+
+      const request = {
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'test' }],
+      };
+      const response = { id: 'test-id', choices: [] };
+
+      const logPath = await logger.logInteraction(
+        request,
+        response,
+        undefined,
+        'side-query:session-title',
+      );
+
+      expect(path.basename(logPath)).toMatch(
+        /openai-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[a-f0-9]{8}-side-query-session-title\.json/,
+      );
+
+      const logContent = JSON.parse(await fs.readFile(logPath, 'utf-8'));
+      expect(logContent).not.toHaveProperty('metadata');
+    });
+
+    it('should not include a filename suffix for non-internal prompt ids', async () => {
+      const logger = new OpenAILogger(testTempDir);
+      await logger.initialize();
+
+      const request = {
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'test' }],
+      };
+      const response = { id: 'test-id', choices: [] };
+
+      const logPath = await logger.logInteraction(
+        request,
+        response,
+        undefined,
+        'user_query',
+      );
+
+      expect(path.basename(logPath)).toMatch(
+        /openai-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[a-f0-9]{8}\.json/,
+      );
+    });
+
+    it('should include a subagent suffix without the session id', async () => {
+      const logger = new OpenAILogger(testTempDir);
+      await logger.initialize();
+
+      const request = {
+        model: 'claude-opus-4-7',
+        messages: [{ role: 'user', content: 'test' }],
+      };
+      const response = { id: 'test-id', choices: [] };
+
+      const logPath = await logger.logInteraction(
+        request,
+        response,
+        undefined,
+        'e097d32b-82d6-422a-afa6-f6184565a8ab#Explore-g2tss0#7',
+      );
+
+      const basename = path.basename(logPath);
+      expect(basename).toMatch(
+        /openai-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[a-f0-9]{8}-subagent-Explore-g2tss0\.json/,
+      );
+      expect(basename).not.toContain('e097d32b');
+    });
+
+    it('should not include a suffix for main-session prompt ids', async () => {
+      const logger = new OpenAILogger(testTempDir);
+      await logger.initialize();
+
+      const request = {
+        model: 'claude-opus-4-7',
+        messages: [{ role: 'user', content: 'test' }],
+      };
+      const response = { id: 'test-id', choices: [] };
+
+      const logPath = await logger.logInteraction(
+        request,
+        response,
+        undefined,
+        'e097d32b-82d6-422a-afa6-f6184565a8ab########0',
+      );
+
+      expect(path.basename(logPath)).toMatch(
+        /openai-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[a-f0-9]{8}\.json/,
+      );
+    });
+
     it('should write correct log data structure', async () => {
       const logger = new OpenAILogger(testTempDir);
       await logger.initialize();
@@ -385,6 +478,88 @@ describe('OpenAILogger', () => {
 
       const logPath = await logger.logInteraction(request, response);
       expect(logPath).toContain(specialPath);
+    });
+  });
+
+  describe('cwd parameter', () => {
+    it('should use provided cwd for default log directory instead of process.cwd()', async () => {
+      const customCwd = path.join(testTempDir, 'project-root');
+      await fs.mkdir(customCwd, { recursive: true });
+      const logger = new OpenAILogger(undefined, customCwd);
+      await logger.initialize();
+
+      const request = { test: 'request' };
+      const response = { test: 'response' };
+
+      const logPath = await logger.logInteraction(request, response);
+      const expectedDir = path.join(customCwd, 'logs', 'openai');
+      createdDirs.push(expectedDir);
+
+      expect(logPath).toContain(expectedDir);
+    });
+
+    it('should resolve relative customLogDir against provided cwd', async () => {
+      const customCwd = path.join(testTempDir, 'project-root-2');
+      await fs.mkdir(customCwd, { recursive: true });
+      const relativeDir = 'my-logs';
+      const logger = new OpenAILogger(relativeDir, customCwd);
+      await logger.initialize();
+
+      const request = { test: 'request' };
+      const response = { test: 'response' };
+
+      const logPath = await logger.logInteraction(request, response);
+      const expectedDir = path.resolve(customCwd, relativeDir);
+      createdDirs.push(expectedDir);
+
+      expect(logPath).toContain(expectedDir);
+    });
+
+    it('should not use cwd when customLogDir is an absolute path', async () => {
+      const customCwd = path.join(testTempDir, 'project-root-3');
+      const absoluteLogDir = path.join(testTempDir, 'absolute-logs');
+      const logger = new OpenAILogger(absoluteLogDir, customCwd);
+      await logger.initialize();
+
+      const request = { test: 'request' };
+      const response = { test: 'response' };
+
+      const logPath = await logger.logInteraction(request, response);
+      createdDirs.push(absoluteLogDir);
+
+      expect(logPath).toContain(absoluteLogDir);
+      expect(logPath).not.toContain(customCwd);
+    });
+
+    it('should not use cwd when customLogDir starts with ~', async () => {
+      const customCwd = path.join(testTempDir, 'project-root-4');
+      const logger = new OpenAILogger('~/test-openai-logs', customCwd);
+      await logger.initialize();
+
+      const request = { test: 'request' };
+      const response = { test: 'response' };
+
+      const logPath = await logger.logInteraction(request, response);
+      const expectedDir = path.join(os.homedir(), 'test-openai-logs');
+      createdDirs.push(expectedDir);
+
+      expect(logPath).toContain(expectedDir);
+      expect(logPath).not.toContain(customCwd);
+    });
+
+    it('should fall back to process.cwd() when cwd is not provided', async () => {
+      const relativeDir = 'test-relative-logs';
+      const logger = new OpenAILogger(relativeDir);
+      await logger.initialize();
+
+      const request = { test: 'request' };
+      const response = { test: 'response' };
+
+      const logPath = await logger.logInteraction(request, response);
+      const expectedDir = path.resolve(process.cwd(), relativeDir);
+      createdDirs.push(expectedDir);
+
+      expect(logPath).toContain(expectedDir);
     });
   });
 });

@@ -9,9 +9,65 @@ import type {
   ToolCallConfirmationDetails,
   ToolEditConfirmationDetails,
 } from '@qwen-code/qwen-code-core';
-import { escapeAnsiCtrlCodes } from './textUtils.js';
+import {
+  escapeAnsiCtrlCodes,
+  sanitizeSensitiveText,
+  sliceTextByVisualHeight,
+} from './textUtils.js';
 
 describe('textUtils', () => {
+  describe('sliceTextByVisualHeight', () => {
+    it('returns the original text when maxHeight is undefined', () => {
+      const sliced = sliceTextByVisualHeight('a\nb\nc', undefined, 10);
+      expect(sliced).toEqual({ text: 'a\nb\nc', hiddenLinesCount: 0 });
+    });
+
+    it('keeps the tail when overflowing from the top (default)', () => {
+      const sliced = sliceTextByVisualHeight('abcdefghijklmnop', 3, 4, {
+        minHeight: 2,
+        reservedRows: 1,
+        overflowDirection: 'top',
+      });
+
+      expect(sliced).toEqual({
+        text: 'ijkl\nmnop',
+        hiddenLinesCount: 2,
+      });
+    });
+
+    it('keeps the head when overflowing from the bottom', () => {
+      const sliced = sliceTextByVisualHeight('a\nb\nc\nd', 3, 80, {
+        overflowDirection: 'bottom',
+      });
+
+      expect(sliced).toEqual({
+        text: 'a\nb\nc',
+        hiddenLinesCount: 1,
+      });
+    });
+
+    it('counts soft wraps in narrow widths as visual rows', () => {
+      const sliced = sliceTextByVisualHeight('aaaa\nbbbbbbbb\ncc', 3, 4, {
+        overflowDirection: 'bottom',
+      });
+
+      expect(sliced.hiddenLinesCount).toBeGreaterThan(0);
+      expect(sliced.text.split('\n').length).toBeLessThanOrEqual(3);
+    });
+
+    it('subtracts reservedRows before deciding whether to truncate', () => {
+      // With reservedRows=1 and maxHeight=3 the visible content budget is 2.
+      // A 3-line input must therefore truncate to 2 rows (not return
+      // unchanged just because it fits inside the unreserved 3-row budget).
+      const sliced = sliceTextByVisualHeight('a\nb\nc', 3, 80, {
+        reservedRows: 1,
+        overflowDirection: 'bottom',
+      });
+
+      expect(sliced).toEqual({ text: 'a\nb', hiddenLinesCount: 1 });
+    });
+  });
+
   describe('escapeAnsiCtrlCodes', () => {
     describe('escapeAnsiCtrlCodes string case study', () => {
       it('should replace ANSI escape codes with a visible representation', () => {
@@ -165,6 +221,73 @@ describe('textUtils', () => {
         expect(sanitized.g).toBe(null);
         expect(sanitized.h()).toBe('\u001b[35mpurple\u001b[0m');
       });
+    });
+  });
+
+  describe('sanitizeSensitiveText', () => {
+    it('should return text unchanged if no sensitive patterns', () => {
+      const text = 'Hello, this is a normal prompt';
+      expect(sanitizeSensitiveText(text)).toBe(text);
+    });
+
+    it('should redact OpenAI-style API keys', () => {
+      const text = 'Use API key sk-1234567890abcdefghijklmnopqrstuv for access';
+      expect(sanitizeSensitiveText(text)).toBe(
+        'Use API key sk-***REDACTED*** for access',
+      );
+    });
+
+    it('should redact api_key assignments', () => {
+      const text = 'api_key=supersecretkey123456789012';
+      expect(sanitizeSensitiveText(text)).toBe('api_key=***REDACTED***');
+    });
+
+    it('should redact Bearer tokens', () => {
+      const text = 'Authorization: Bearer abc123token456xyz';
+      expect(sanitizeSensitiveText(text)).toBe(
+        'Authorization: Bearer ***REDACTED***',
+      );
+    });
+
+    it('should redact password assignments', () => {
+      const text = 'password=mysecretpassword123';
+      expect(sanitizeSensitiveText(text)).toBe('password=***REDACTED***');
+    });
+
+    it('should redact AWS access keys', () => {
+      const text = 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE';
+      expect(sanitizeSensitiveText(text)).toBe(
+        'AWS_ACCESS_KEY_ID=***REDACTED***',
+      );
+    });
+
+    it('should truncate long text', () => {
+      const text = 'a'.repeat(300);
+      const result = sanitizeSensitiveText(text, 200);
+      expect(result.length).toBe(200);
+      expect(result.endsWith('...')).toBe(true);
+    });
+
+    it('should handle custom max length', () => {
+      const text =
+        'This is a test prompt with sk-1234567890abcdefghijklmnopqrstuv';
+      const result = sanitizeSensitiveText(text, 20);
+      expect(result.length).toBe(20);
+      expect(result).toBe('This is a test pr...');
+    });
+
+    it('should handle empty string', () => {
+      expect(sanitizeSensitiveText('')).toBe('');
+    });
+
+    it('should redact multiple sensitive patterns', () => {
+      const text =
+        'api_key=secretkey12345678901234 and password=mypass123 and sk-test123456789012345678901';
+      const result = sanitizeSensitiveText(text);
+      expect(result).toContain('***REDACTED***');
+      expect(result).not.toContain('secretkey12345678901234');
+      expect(result).not.toContain('mypass123');
+      expect(result).not.toContain('sk-test123456789012345678901');
     });
   });
 });

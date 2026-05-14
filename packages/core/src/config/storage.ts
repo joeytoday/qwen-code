@@ -6,26 +6,129 @@
 
 import * as path from 'node:path';
 import * as os from 'node:os';
-import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { getProjectHash, QWEN_DIR, sanitizeCwd } from '../utils/paths.js';
 
-export const QWEN_DIR = '.qwen';
+export { QWEN_DIR } from '../utils/paths.js';
 export const GOOGLE_ACCOUNTS_FILENAME = 'google_accounts.json';
 export const OAUTH_FILE = 'oauth_creds.json';
+export const SKILL_PROVIDER_CONFIG_DIRS = ['.qwen', '.agents'];
 const TMP_DIR_NAME = 'tmp';
 const BIN_DIR_NAME = 'bin';
 const PROJECT_DIR_NAME = 'projects';
 const IDE_DIR_NAME = 'ide';
+const PLANS_DIR_NAME = 'plans';
 const DEBUG_DIR_NAME = 'debug';
+const ARENA_DIR_NAME = 'arena';
 
 export class Storage {
   private readonly targetDir: string;
+
+  /**
+   * Custom runtime output base directory set via settings.
+   * When null, falls back to getGlobalQwenDir().
+   */
+  private static runtimeBaseDir: string | null = null;
+  private static readonly runtimeBaseDirContext = new AsyncLocalStorage<
+    string | null
+  >();
 
   constructor(targetDir: string) {
     this.targetDir = targetDir;
   }
 
+  /**
+   * Expands tilde and resolves relative paths to absolute.
+   */
+  private static resolvePath(dir: string, cwd?: string): string {
+    let resolved = dir;
+    if (
+      resolved === '~' ||
+      resolved.startsWith('~/') ||
+      resolved.startsWith('~\\')
+    ) {
+      const relativeSegments =
+        resolved === '~'
+          ? []
+          : resolved
+              .slice(2)
+              .split(/[/\\]+/)
+              .filter(Boolean);
+      resolved = path.join(os.homedir(), ...relativeSegments);
+    }
+    if (!path.isAbsolute(resolved)) {
+      resolved = cwd ? path.resolve(cwd, resolved) : path.resolve(resolved);
+    }
+    return resolved;
+  }
+
+  private static resolveRuntimeBaseDir(
+    dir: string | null | undefined,
+    cwd?: string,
+  ): string | null {
+    if (!dir) {
+      return null;
+    }
+    return Storage.resolvePath(dir, cwd);
+  }
+
+  /**
+   * Sets the custom runtime output base directory.
+   * Handles tilde (~) expansion and resolves relative paths to absolute.
+   * Pass null/undefined/empty string to reset to default (getGlobalQwenDir()).
+   * @param dir - The directory path, or null/undefined to reset
+   * @param cwd - Base directory for resolving relative paths (defaults to process.cwd()).
+   *              Pass the project root so that relative values like ".qwen" resolve
+   *              per-project, enabling a single global config to work across all projects.
+   */
+  static setRuntimeBaseDir(dir: string | null | undefined, cwd?: string): void {
+    Storage.runtimeBaseDir = Storage.resolveRuntimeBaseDir(dir, cwd);
+  }
+
+  /**
+   * Runs function execution in an async context with a specific runtime output dir.
+   * This is used to isolate runtime output paths between concurrent sessions.
+   */
+  static runWithRuntimeBaseDir<T>(
+    dir: string | null | undefined,
+    cwd: string | undefined,
+    fn: () => T,
+  ): T {
+    const resolved = Storage.resolveRuntimeBaseDir(dir, cwd);
+    return Storage.runtimeBaseDirContext.run(resolved, fn);
+  }
+
+  /**
+   * Returns the base directory for all runtime output (temp files, debug logs,
+   * session data, todos, insights, etc.).
+   *
+   * Priority: QWEN_RUNTIME_DIR env var > setRuntimeBaseDir() value > getGlobalQwenDir()
+   * @returns Absolute path to the runtime output base directory
+   */
+  static getRuntimeBaseDir(): string {
+    const envDir = process.env['QWEN_RUNTIME_DIR'];
+    if (envDir) {
+      return (
+        Storage.resolveRuntimeBaseDir(envDir) ?? Storage.getGlobalQwenDir()
+      );
+    }
+
+    const contextualDir = Storage.runtimeBaseDirContext.getStore();
+    if (contextualDir !== undefined) {
+      return contextualDir ?? Storage.getGlobalQwenDir();
+    }
+    if (Storage.runtimeBaseDir) {
+      return Storage.runtimeBaseDir;
+    }
+    return Storage.getGlobalQwenDir();
+  }
+
   static getGlobalQwenDir(): string {
+    const envDir = process.env['QWEN_HOME'];
+    if (envDir) {
+      return Storage.resolvePath(envDir);
+    }
     const homeDir = os.homedir();
     if (!homeDir) {
       return path.join(os.tmpdir(), '.qwen');
@@ -58,11 +161,11 @@ export class Storage {
   }
 
   static getGlobalTempDir(): string {
-    return path.join(Storage.getGlobalQwenDir(), TMP_DIR_NAME);
+    return path.join(Storage.getRuntimeBaseDir(), TMP_DIR_NAME);
   }
 
   static getGlobalDebugDir(): string {
-    return path.join(Storage.getGlobalQwenDir(), DEBUG_DIR_NAME);
+    return path.join(Storage.getRuntimeBaseDir(), DEBUG_DIR_NAME);
   }
 
   static getDebugLogPath(sessionId: string): string {
@@ -70,11 +173,26 @@ export class Storage {
   }
 
   static getGlobalIdeDir(): string {
+    // Pinned to the global Qwen dir so the VS Code companion (which only
+    // sees env vars, not settings-based runtimeOutputDir) finds the same
+    // lock-file location as the CLI.
     return path.join(Storage.getGlobalQwenDir(), IDE_DIR_NAME);
+  }
+
+  static getPlansDir(): string {
+    return path.join(Storage.getGlobalQwenDir(), PLANS_DIR_NAME);
+  }
+
+  static getPlanFilePath(sessionId: string): string {
+    return path.join(Storage.getPlansDir(), `${sessionId}.md`);
   }
 
   static getGlobalBinDir(): string {
     return path.join(Storage.getGlobalQwenDir(), BIN_DIR_NAME);
+  }
+
+  static getGlobalArenaDir(): string {
+    return path.join(Storage.getGlobalQwenDir(), ARENA_DIR_NAME);
   }
 
   getQwenDir(): string {
@@ -82,15 +200,19 @@ export class Storage {
   }
 
   getProjectDir(): string {
-    const projectId = this.sanitizeCwd(this.getProjectRoot());
-    const projectsDir = path.join(Storage.getGlobalQwenDir(), PROJECT_DIR_NAME);
+    const projectId = sanitizeCwd(this.getProjectRoot());
+    const projectsDir = path.join(
+      Storage.getRuntimeBaseDir(),
+      PROJECT_DIR_NAME,
+    );
     return path.join(projectsDir, projectId);
   }
 
   getProjectTempDir(): string {
-    const hash = this.getFilePathHash(this.getProjectRoot());
+    const hash = getProjectHash(this.getProjectRoot());
     const tempDir = Storage.getGlobalTempDir();
-    return path.join(tempDir, hash);
+    const targetDir = path.join(tempDir, hash);
+    return targetDir;
   }
 
   ensureProjectTempDirExists(): void {
@@ -105,14 +227,11 @@ export class Storage {
     return this.targetDir;
   }
 
-  private getFilePathHash(filePath: string): string {
-    return crypto.createHash('sha256').update(filePath).digest('hex');
-  }
-
   getHistoryDir(): string {
-    const hash = this.getFilePathHash(this.getProjectRoot());
-    const historyDir = path.join(Storage.getGlobalQwenDir(), 'history');
-    return path.join(historyDir, hash);
+    const hash = getProjectHash(this.getProjectRoot());
+    const historyDir = path.join(Storage.getRuntimeBaseDir(), 'history');
+    const targetDir = path.join(historyDir, hash);
+    return targetDir;
   }
 
   getWorkspaceSettingsPath(): string {
@@ -121,6 +240,22 @@ export class Storage {
 
   getProjectCommandsDir(): string {
     return path.join(this.getQwenDir(), 'commands');
+  }
+
+  /**
+   * Path to the runtime-status sidecar JSON for this session.
+   *
+   * Co-located with the per-session chat log under
+   * `<projectDir>/chats/<sessionId>.runtime.json` so external observers
+   * (terminal multiplexers, IDE integrations, status daemons) can scan
+   * the same directory used for chat history to find live sessions.
+   */
+  getRuntimeStatusPath(sessionId: string): string {
+    return path.join(
+      this.getProjectDir(),
+      'chats',
+      `${sessionId}.runtime.json`,
+    );
   }
 
   getProjectTempCheckpointsDir(): string {
@@ -135,15 +270,25 @@ export class Storage {
     return path.join(this.getExtensionsDir(), 'qwen-extension.json');
   }
 
-  getUserSkillsDir(): string {
-    return path.join(Storage.getGlobalQwenDir(), 'skills');
+  getUserSkillsDirs(): string[] {
+    const homeDir = os.homedir() || os.tmpdir();
+    return SKILL_PROVIDER_CONFIG_DIRS.map((dir) =>
+      dir === QWEN_DIR
+        ? path.join(Storage.getGlobalQwenDir(), 'skills')
+        : path.join(homeDir, dir, 'skills'),
+    );
+  }
+
+  /**
+   * Returns the user-level extensions directory (~/.qwen/extensions/).
+   * Extensions installed at user scope are stored here, as opposed to
+   * project-level extensions which live in <project>/.qwen/extensions/.
+   */
+  static getUserExtensionsDir(): string {
+    return path.join(Storage.getGlobalQwenDir(), 'extensions');
   }
 
   getHistoryFilePath(): string {
     return path.join(this.getProjectTempDir(), 'shell_history');
-  }
-
-  private sanitizeCwd(cwd: string): string {
-    return cwd.replace(/[^a-zA-Z0-9]/g, '-');
   }
 }

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2025 Qwen
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -11,18 +11,25 @@ import { ContextUsageDisplay } from './ContextUsageDisplay.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { AutoAcceptIndicator } from './AutoAcceptIndicator.js';
 import { ShellModeIndicator } from './ShellModeIndicator.js';
+import { BackgroundTasksPill } from './background-view/BackgroundTasksPill.js';
+import { MCPHealthPill } from './mcp/MCPHealthPill.js';
 import { isNarrowWidth } from '../utils/isNarrowWidth.js';
 
+import { useStatusLine } from '../hooks/useStatusLine.js';
+import { useConfigInitMessage } from '../hooks/useConfigInitMessage.js';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useConfig } from '../contexts/ConfigContext.js';
 import { useVimMode } from '../contexts/VimModeContext.js';
 import { ApprovalMode } from '@qwen-code/qwen-code-core';
+import { GeminiSpinner } from './GeminiRespondingSpinner.js';
 import { t } from '../../i18n/index.js';
 
 export const Footer: React.FC = () => {
   const uiState = useUIState();
   const config = useConfig();
   const { vimEnabled, vimMode } = useVimMode();
+  const { lines: statusLineLines } = useStatusLine();
+  const configInitMessage = useConfigInitMessage(uiState.isConfigInitialized);
 
   const { promptTokenCount, showAutoAcceptIndicator } = {
     promptTokenCount: uiState.sessionStats.lastPromptTokenCount,
@@ -48,21 +55,41 @@ export const Footer: React.FC = () => {
   const contextWindowSize =
     config.getContentGeneratorConfig()?.contextWindowSize;
 
-  // Left section should show exactly ONE thing at any time, in priority order.
-  const leftContent = uiState.ctrlCPressedOnce ? (
+  // Hide "? for shortcuts" when a custom status line is active (it already
+  // occupies the footer, so the hint is redundant). Matches upstream behavior.
+  const suppressHint = statusLineLines.length > 0;
+
+  // MCP init progress lives in this row (not a standalone component above the
+  // input) so the live area's height is constant in the default case, avoiding
+  // the residual-blank-line artifact left behind when a separate block unmounts.
+  // When a custom status line is active, the row shrinks by 1 on transition to
+  // ready — a one-time, small regression preferred over hiding init progress.
+  //
+  // `configInitMessage` is placed ahead of `showAutoAcceptIndicator` so users
+  // launched with YOLO / auto-accept-edits still see the ~1s startup progress;
+  // the approval-mode indicator takes over as soon as init finishes.
+  const leftBottomContent = uiState.ctrlCPressedOnce ? (
     <Text color={theme.status.warning}>{t('Press Ctrl+C again to exit.')}</Text>
   ) : uiState.ctrlDPressedOnce ? (
     <Text color={theme.status.warning}>{t('Press Ctrl+D again to exit.')}</Text>
   ) : uiState.showEscapePrompt ? (
     <Text color={theme.text.secondary}>{t('Press Esc again to clear.')}</Text>
+  ) : uiState.rewindEscPending ? (
+    <Text color={theme.text.secondary}>
+      {t('Press Esc again to rewind conversation.')}
+    </Text>
   ) : vimEnabled && vimMode === 'INSERT' ? (
     <Text color={theme.text.secondary}>-- INSERT --</Text>
   ) : uiState.shellModeActive ? (
     <ShellModeIndicator />
+  ) : configInitMessage ? (
+    <Text color={theme.text.secondary}>
+      <GeminiSpinner /> {configInitMessage}
+    </Text>
   ) : showAutoAcceptIndicator !== undefined &&
     showAutoAcceptIndicator !== ApprovalMode.DEFAULT ? (
     <AutoAcceptIndicator approvalMode={showAutoAcceptIndicator} />
-  ) : (
+  ) : suppressHint ? null : (
     <Text color={theme.text.secondary}>{t('? for shortcuts')}</Text>
   );
 
@@ -79,6 +106,10 @@ export const Footer: React.FC = () => {
       node: <Text color={theme.status.warning}>Debug Mode</Text>,
     });
   }
+  // Dream tasks now surface via the BackgroundTasksPill (e.g. "1 dream")
+  // alongside the other background-task kinds. The previous `✦ dreaming`
+  // right-column indicator was removed to avoid two simultaneous signals
+  // for the same underlying state.
   if (promptTokenCount > 0 && contextWindowSize) {
     rightItems.push({
       key: 'context',
@@ -93,25 +124,37 @@ export const Footer: React.FC = () => {
       ),
     });
   }
+
+  // Layout matches upstream: left column has status line (top) + hints/mode
+  // (bottom), right section has indicators. Status line and hints coexist.
   return (
     <Box
-      justifyContent="space-between"
+      flexDirection={isNarrow ? 'column' : 'row'}
+      justifyContent={isNarrow ? 'flex-start' : 'space-between'}
       width="100%"
-      flexDirection="row"
-      alignItems="center"
+      paddingX={2}
+      gap={isNarrow ? 0 : 1}
     >
-      {/* Left Section: Exactly one status line (exit prompts / mode indicator / default hint) */}
-      <Box
-        marginLeft={2}
-        justifyContent="flex-start"
-        flexDirection={isNarrow ? 'column' : 'row'}
-        alignItems={isNarrow ? 'flex-start' : 'center'}
-      >
-        {leftContent}
+      {/* Left column — status line on top, hints/mode on bottom */}
+      <Box flexDirection="column" flexShrink={isNarrow ? 0 : 1}>
+        {statusLineLines.length > 0 &&
+          !uiState.ctrlCPressedOnce &&
+          !uiState.ctrlDPressedOnce &&
+          statusLineLines.map((line, i) => (
+            <Text key={`status-line-${i}`} dimColor wrap="truncate">
+              {line}
+            </Text>
+          ))}
+        <Box flexDirection="row" flexShrink={1}>
+          <Text wrap="truncate">{leftBottomContent}</Text>
+          <BackgroundTasksPill />
+          <MCPHealthPill />
+        </Box>
       </Box>
 
-      {/* Right Section: Sandbox Info, Debug Mode, Context Usage, and Console Summary */}
-      <Box alignItems="center" justifyContent="flex-end" marginRight={2}>
+      {/* Right Section — never compressed, aligns to top so multi-line
+          status lines on the left don't push the indicators to the center. */}
+      <Box flexShrink={0} gap={1} alignItems="flex-start">
         {rightItems.map(({ key, node }, index) => (
           <Box key={key} alignItems="center">
             {index > 0 && <Text color={theme.text.secondary}> | </Text>}

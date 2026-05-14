@@ -454,7 +454,7 @@ describe('ModelsConfig', () => {
     });
 
     // Switching within qwen-oauth triggers applyResolvedModelDefaults().
-    await modelsConfig.switchModel(AuthType.QWEN_OAUTH, 'vision-model');
+    await modelsConfig.switchModel(AuthType.QWEN_OAUTH, 'coder-model');
 
     const gc = currentGenerationConfig(modelsConfig);
     expect(gc.apiKey).toBe('QWEN_OAUTH_DYNAMIC_TOKEN');
@@ -595,6 +595,639 @@ describe('ModelsConfig', () => {
     expect(gc.apiKey).toBe('manual-openai-key');
     expect(gc.baseUrl).toBe('https://manual.example.com/v1');
     expect(gc.samplingParams?.temperature).toBe(0.9); // Preserved from initial config
+  });
+
+  it('should fall back to settings-sourced apiKey when registry model envKey is not in process.env (restart scenario)', () => {
+    // Simulate the restart scenario from issue #3417:
+    // 1. User has settings.security.auth.apiKey = 'settings-api-key'
+    // 2. modelProviders.openai has a model with envKey = 'CODING_PLAN_KEY'
+    // 3. process.env['CODING_PLAN_KEY'] is NOT set
+    // 4. resolveCliGenerationConfig correctly resolved apiKey from settings (layer 4)
+    // 5. syncAfterAuthRefresh should NOT discard the settings-sourced key
+
+    const envKey = 'CODING_PLAN_KEY_TEST_3417';
+    // Ensure the env var is NOT set
+    delete process.env[envKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'qwen3.5-plus',
+          name: 'Test Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey,
+          generationConfig: {
+            samplingParams: { temperature: 0.3 },
+          },
+        },
+      ],
+    };
+
+    // ModelsConfig initialized with settings-sourced apiKey (as would happen at startup)
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'qwen3.5-plus',
+        apiKey: 'settings-api-key',
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        baseUrl: { kind: 'settings', detail: 'security.auth.baseUrl' },
+      },
+    });
+
+    // Verify initial state
+    expect(currentGenerationConfig(modelsConfig).apiKey).toBe(
+      'settings-api-key',
+    );
+
+    // Simulate what refreshAuth does on startup
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'qwen3.5-plus');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // The settings-sourced apiKey should be preserved as fallback
+    expect(gc.apiKey).toBe('settings-api-key');
+    // envKey metadata should still be set for diagnostics
+    expect(gc.apiKeyEnvKey).toBe(envKey);
+    // Model and other provider config should be applied
+    expect(gc.model).toBe('qwen3.5-plus');
+    expect(gc.samplingParams?.temperature).toBe(0.3);
+
+    // Source should still reflect settings origin
+    const sources = modelsConfig.getGenerationConfigSources();
+    expect(sources['apiKey']?.kind).toBe('settings');
+  });
+
+  it('should prefer env var over settings apiKey when both exist (restart scenario)', () => {
+    const envKey = 'CODING_PLAN_KEY_TEST_3417_PREFER';
+    // Set the env var
+    process.env[envKey] = 'env-api-key';
+
+    try {
+      const modelProvidersConfig: ModelProvidersConfig = {
+        openai: [
+          {
+            id: 'test-model',
+            name: 'Test Model',
+            baseUrl: 'https://api.example.com/v1',
+            envKey,
+          },
+        ],
+      };
+
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig,
+        generationConfig: {
+          model: 'test-model',
+          apiKey: 'settings-api-key',
+        },
+        generationConfigSources: {
+          model: { kind: 'settings', detail: 'settings.model.name' },
+          apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        },
+      });
+
+      modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'test-model');
+
+      const gc = currentGenerationConfig(modelsConfig);
+      // Env var should take priority over settings apiKey
+      expect(gc.apiKey).toBe('env-api-key');
+      expect(gc.apiKeyEnvKey).toBe(envKey);
+
+      const sources = modelsConfig.getGenerationConfigSources();
+      expect(sources['apiKey']?.kind).toBe('env');
+    } finally {
+      delete process.env[envKey];
+    }
+  });
+
+  it('should preserve programmatic apiKey when authType and modelId unchanged (restart scenario)', () => {
+    // When apiKey was set via updateCredentials (programmatic source) and
+    // syncAfterAuthRefresh is called with the same authType+modelId,
+    // the short-circuit should preserve the existing key.
+    const envKey = 'CODING_PLAN_KEY_TEST_3417_PROG';
+    delete process.env[envKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'provider-model',
+          name: 'Provider Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'provider-model',
+        apiKey: 'programmatic-key',
+      },
+      generationConfigSources: {
+        model: { kind: 'programmatic', detail: 'updateCredentials' },
+        apiKey: { kind: 'programmatic', detail: 'updateCredentials' },
+      },
+    });
+
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'provider-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // Same authType + same modelId → apiKey preserved via save/restore around applyResolvedModelDefaults
+    expect(gc.apiKey).toBe('programmatic-key');
+  });
+
+  it('should NOT preserve env apiKey with via.modelProviders during model switch', () => {
+    // When switching from model-a to model-b, model-a's provider-specific
+    // envKey value should NOT be reused for model-b — they may target
+    // different services with different credentials.
+    const envKeyA = 'PROVIDER_KEY_A_TEST_3417';
+    const envKeyB = 'PROVIDER_KEY_B_TEST_3417';
+    delete process.env[envKeyA];
+    delete process.env[envKeyB];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'model-a',
+          name: 'Model A',
+          baseUrl: 'https://api-a.example.com/v1',
+          envKey: envKeyA,
+        },
+        {
+          id: 'model-b',
+          name: 'Model B',
+          baseUrl: 'https://api-b.example.com/v1',
+          envKey: envKeyB,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'model-a',
+        apiKey: 'key-for-model-a',
+      },
+      generationConfigSources: {
+        model: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'model-a',
+          detail: 'model.id',
+        },
+        apiKey: {
+          kind: 'env',
+          envKey: envKeyA,
+          via: {
+            kind: 'modelProviders',
+            authType: 'openai',
+            modelId: 'model-a',
+            detail: 'envKey',
+          },
+        },
+      },
+    });
+
+    // Switch to model-b whose envKey is also not set
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'model-b');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // model-a's key should NOT be reused for model-b
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.model).toBe('model-b');
+  });
+
+  it('should NOT preserve settings-sourced apiKey when switching to a different provider within same authType', () => {
+    // Cross-provider switch: provider-A (settings-sourced key) → provider-B
+    // Settings key must NOT leak to provider-B which may have a different baseUrl.
+    const envKeyA = 'PROVIDER_KEY_A_SETTINGS_TEST';
+    const envKeyB = 'PROVIDER_KEY_B_SETTINGS_TEST';
+    delete process.env[envKeyA];
+    delete process.env[envKeyB];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'provider-a',
+          name: 'Provider A',
+          baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          envKey: envKeyA,
+        },
+        {
+          id: 'provider-b',
+          name: 'Provider B',
+          baseUrl: 'https://api.openai.com/v1',
+          envKey: envKeyB,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'provider-a',
+        apiKey: 'settings-api-key',
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        baseUrl: { kind: 'settings', detail: 'security.auth.baseUrl' },
+      },
+    });
+
+    // Switch to provider-b (different model, same authType)
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'provider-b');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // settings-sourced key for provider-a must NOT be sent to provider-b
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.model).toBe('provider-b');
+    expect(gc.baseUrl).toBe('https://api.openai.com/v1');
+  });
+
+  it('should NOT preserve CLI-sourced apiKey when switching to a different provider within same authType', () => {
+    // Cross-provider switch: provider-A (CLI-sourced key) → provider-B
+    const envKeyA = 'PROVIDER_KEY_A_CLI_TEST';
+    const envKeyB = 'PROVIDER_KEY_B_CLI_TEST';
+    delete process.env[envKeyA];
+    delete process.env[envKeyB];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'cli-provider-a',
+          name: 'CLI Provider A',
+          baseUrl: 'https://api-a.example.com/v1',
+          envKey: envKeyA,
+        },
+        {
+          id: 'cli-provider-b',
+          name: 'CLI Provider B',
+          baseUrl: 'https://api-b.example.com/v1',
+          envKey: envKeyB,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'cli-provider-a',
+        apiKey: 'cli-provided-key',
+      },
+      generationConfigSources: {
+        model: { kind: 'cli', detail: '--model' },
+        apiKey: { kind: 'cli', detail: '--openaiApiKey' },
+      },
+    });
+
+    // Switch to cli-provider-b (different model, same authType)
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'cli-provider-b');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // CLI key for provider-a must NOT be sent to provider-b
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.model).toBe('cli-provider-b');
+    expect(gc.baseUrl).toBe('https://api-b.example.com/v1');
+  });
+
+  it('should NOT preserve apiKey on first syncAfterAuthRefresh when previousAuthType is undefined (cold start)', () => {
+    // Cold start: ModelsConfig created without initialAuthType, then
+    // syncAfterAuthRefresh is called for the first time. previousAuthType
+    // is undefined, so isUnchanged must be false — no key preservation.
+    const envKey = 'COLD_START_KEY_TEST_3417';
+    delete process.env[envKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'cold-start-model',
+          name: 'Cold Start Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'cold-start-model',
+        apiKey: 'stale-key-from-previous-session',
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+      },
+    });
+
+    // First auth refresh — previousAuthType is undefined
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'cold-start-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // previousAuthType (undefined) !== USE_OPENAI → isUnchanged is false → no preservation
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.model).toBe('cold-start-model');
+  });
+
+  it('should NOT preserve apiKey when same modelId but envKey changed (hot-reload)', () => {
+    // Hot-reload scenario: model provider config is reloaded, changing the
+    // envKey for the same model id. The old apiKey must NOT be restored.
+    const oldEnvKey = 'OLD_ENV_KEY_HOT_RELOAD_TEST';
+    const newEnvKey = 'NEW_ENV_KEY_HOT_RELOAD_TEST';
+    delete process.env[oldEnvKey];
+    delete process.env[newEnvKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'hot-reload-model',
+          name: 'Hot Reload Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey: oldEnvKey,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'hot-reload-model',
+        apiKey: 'old-api-key',
+        baseUrl: 'https://api.example.com/v1',
+        apiKeyEnvKey: oldEnvKey,
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        baseUrl: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'hot-reload-model',
+          detail: 'baseUrl',
+        },
+        apiKeyEnvKey: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'hot-reload-model',
+          detail: 'envKey',
+        },
+      },
+    });
+
+    // Simulate hot-reload: update registry with new envKey
+    modelsConfig.reloadModelProvidersConfig({
+      openai: [
+        {
+          id: 'hot-reload-model',
+          name: 'Hot Reload Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey: newEnvKey,
+        },
+      ],
+    });
+
+    // syncAfterAuthRefresh with same authType and modelId
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'hot-reload-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // envKey changed → isUnchanged is false → old key must NOT be preserved
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.apiKeyEnvKey).toBe(newEnvKey);
+    expect(gc.model).toBe('hot-reload-model');
+  });
+
+  it('should NOT preserve apiKey when same modelId but baseUrl changed (hot-reload)', () => {
+    // Hot-reload scenario: model provider config is reloaded, changing the
+    // baseUrl for the same model id. The old apiKey must NOT be restored.
+    const envKey = 'BASE_URL_HOT_RELOAD_TEST';
+    delete process.env[envKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'url-reload-model',
+          name: 'URL Reload Model',
+          baseUrl: 'https://old-api.example.com/v1',
+          envKey,
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'url-reload-model',
+        apiKey: 'old-api-key',
+        baseUrl: 'https://old-api.example.com/v1',
+        apiKeyEnvKey: envKey,
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        baseUrl: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'url-reload-model',
+          detail: 'baseUrl',
+        },
+        apiKeyEnvKey: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'url-reload-model',
+          detail: 'envKey',
+        },
+      },
+    });
+
+    // Simulate hot-reload: update registry with new baseUrl
+    modelsConfig.reloadModelProvidersConfig({
+      openai: [
+        {
+          id: 'url-reload-model',
+          name: 'URL Reload Model',
+          baseUrl: 'https://new-api.example.com/v1',
+          envKey,
+        },
+      ],
+    });
+
+    // syncAfterAuthRefresh with same authType and modelId
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'url-reload-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // baseUrl changed → isUnchanged is false → old key must NOT be preserved
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.baseUrl).toBe('https://new-api.example.com/v1');
+    expect(gc.model).toBe('url-reload-model');
+  });
+
+  it('should NOT preserve apiKey when no-envKey model has baseUrl changed (hot-reload)', () => {
+    // Hot-reload scenario for a model without envKey: baseUrl changes but
+    // modelId stays the same. The old apiKey must NOT be restored.
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'no-envkey-model',
+          name: 'No EnvKey Model',
+          baseUrl: 'https://old-api.example.com/v1',
+          // no envKey
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'no-envkey-model',
+        apiKey: 'old-settings-key',
+        baseUrl: 'https://old-api.example.com/v1',
+      },
+      // Simulate post-apply state: baseUrl source is modelProviders
+      generationConfigSources: {
+        model: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'no-envkey-model',
+          detail: 'model.id',
+        },
+        apiKey: { kind: 'settings', detail: 'security.auth.apiKey' },
+        baseUrl: {
+          kind: 'modelProviders',
+          authType: 'openai',
+          modelId: 'no-envkey-model',
+          detail: 'baseUrl',
+        },
+      },
+    });
+
+    // Simulate hot-reload: update registry with new baseUrl
+    modelsConfig.reloadModelProvidersConfig({
+      openai: [
+        {
+          id: 'no-envkey-model',
+          name: 'No EnvKey Model',
+          baseUrl: 'https://new-api.example.com/v1',
+        },
+      ],
+    });
+
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'no-envkey-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // baseUrl changed → isProviderChanged is true even without envKey
+    expect(gc.apiKey).toBeUndefined();
+    expect(gc.baseUrl).toBe('https://new-api.example.com/v1');
+    expect(gc.model).toBe('no-envkey-model');
+  });
+
+  it('should preserve general env var apiKey (e.g. OPENAI_API_KEY) when provider envKey is absent', () => {
+    // If the user has OPENAI_API_KEY set but NOT the provider-specific envKey,
+    // the general env var should be preserved as a fallback.
+    const providerEnvKey = 'SPECIFIC_PROVIDER_KEY_TEST_3417';
+    delete process.env[providerEnvKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'test-model',
+          name: 'Test Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey: providerEnvKey,
+        },
+      ],
+    };
+
+    // resolveCliGenerationConfig resolved apiKey from OPENAI_API_KEY (layer 3)
+    // — source has kind:'env' but no 'via' (general env var, not provider-specific)
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'test-model',
+        apiKey: 'openai-api-key-value',
+      },
+      generationConfigSources: {
+        model: { kind: 'settings', detail: 'settings.model.name' },
+        apiKey: { kind: 'env', envKey: 'OPENAI_API_KEY' },
+      },
+    });
+
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'test-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // General env var key should be preserved
+    expect(gc.apiKey).toBe('openai-api-key-value');
+
+    const sources = modelsConfig.getGenerationConfigSources();
+    expect(sources['apiKey']?.kind).toBe('env');
+    expect(sources['apiKey']?.envKey).toBe('OPENAI_API_KEY');
+  });
+
+  it('should preserve CLI-sourced apiKey (--openaiApiKey) when registry model envKey is absent', () => {
+    // Regression: CLI-passed keys (source kind 'cli') must not be discarded
+    // during syncAfterAuthRefresh when the provider's envKey is unset.
+    const envKey = 'CODING_PLAN_KEY_TEST_3417_CLI';
+    delete process.env[envKey];
+
+    const modelProvidersConfig: ModelProvidersConfig = {
+      openai: [
+        {
+          id: 'cli-test-model',
+          name: 'CLI Test Model',
+          baseUrl: 'https://api.example.com/v1',
+          envKey,
+          generationConfig: {
+            samplingParams: { temperature: 0.5 },
+          },
+        },
+      ],
+    };
+
+    const modelsConfig = new ModelsConfig({
+      initialAuthType: AuthType.USE_OPENAI,
+      modelProvidersConfig,
+      generationConfig: {
+        model: 'cli-test-model',
+        apiKey: 'cli-provided-key',
+      },
+      generationConfigSources: {
+        model: { kind: 'cli', detail: '--model' },
+        apiKey: { kind: 'cli', detail: '--openaiApiKey' },
+      },
+    });
+
+    // Verify initial state
+    expect(currentGenerationConfig(modelsConfig).apiKey).toBe(
+      'cli-provided-key',
+    );
+
+    modelsConfig.syncAfterAuthRefresh(AuthType.USE_OPENAI, 'cli-test-model');
+
+    const gc = currentGenerationConfig(modelsConfig);
+    // CLI-sourced apiKey should be preserved as fallback
+    expect(gc.apiKey).toBe('cli-provided-key');
+    expect(gc.apiKeyEnvKey).toBe(envKey);
+    expect(gc.model).toBe('cli-test-model');
+    expect(gc.samplingParams?.temperature).toBe(0.5);
+
+    const sources = modelsConfig.getGenerationConfigSources();
+    expect(sources['apiKey']?.kind).toBe('cli');
+    expect(sources['apiKey']?.detail).toBe('--openaiApiKey');
   });
 
   it('should maintain consistency between currentModelId and _generationConfig.model after initialization', () => {
@@ -1295,6 +1928,341 @@ describe('ModelsConfig', () => {
         apiKey: baselineGc.apiKey,
         baseUrl: baselineGc.baseUrl,
       });
+    });
+  });
+
+  describe('reloadModelProvidersConfig', () => {
+    it('should reload model providers configuration', async () => {
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig: {
+          openai: [{ id: 'gpt-4', name: 'GPT-4' }],
+        },
+      });
+
+      // Verify initial model
+      await modelsConfig.switchModel(AuthType.USE_OPENAI, 'gpt-4');
+      expect(modelsConfig.getModel()).toBe('gpt-4');
+
+      // Reload with new config
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [{ id: 'gpt-3.5', name: 'GPT-3.5' }],
+      });
+
+      // After reload, old model should not exist
+      expect(
+        modelsConfig.getAllConfiguredModels().find((m) => m.id === 'gpt-4'),
+      ).toBeUndefined();
+      expect(
+        modelsConfig.getAllConfiguredModels().find((m) => m.id === 'gpt-3.5'),
+      ).toBeDefined();
+    });
+
+    it('should preserve current model selection if still available after reload', async () => {
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig: {
+          openai: [
+            { id: 'gpt-4', name: 'GPT-4' },
+            { id: 'gpt-3.5', name: 'GPT-3.5' },
+          ],
+        },
+      });
+
+      await modelsConfig.switchModel(AuthType.USE_OPENAI, 'gpt-4');
+      expect(modelsConfig.getModel()).toBe('gpt-4');
+
+      // Reload with config that still includes gpt-4
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [
+          { id: 'gpt-4', name: 'GPT-4 Updated' },
+          { id: 'new-model', name: 'New Model' },
+        ],
+      });
+
+      // Current model should still be available
+      const availableModels = modelsConfig.getAllConfiguredModels();
+      expect(availableModels.find((m) => m.id === 'gpt-4')).toBeDefined();
+      expect(availableModels.find((m) => m.id === 'new-model')).toBeDefined();
+    });
+
+    it('should update available models after reload', async () => {
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig: {
+          openai: [{ id: 'gpt-4', name: 'GPT-4' }],
+        },
+      });
+
+      const initialModels = modelsConfig.getAllConfiguredModels();
+      expect(initialModels.some((m) => m.id === 'gpt-4')).toBe(true);
+      expect(initialModels.some((m) => m.id === 'gemini-pro')).toBe(false);
+
+      // Reload with different config
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [{ id: 'gpt-3.5', name: 'GPT-3.5' }],
+        gemini: [{ id: 'gemini-pro', name: 'Gemini Pro' }],
+      });
+
+      const updatedModels = modelsConfig.getAllConfiguredModels();
+      expect(updatedModels.some((m) => m.id === 'gpt-4')).toBe(false);
+      expect(updatedModels.some((m) => m.id === 'gpt-3.5')).toBe(true);
+      expect(updatedModels.some((m) => m.id === 'gemini-pro')).toBe(true);
+    });
+
+    it('should handle reload with empty config', async () => {
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig: {
+          openai: [{ id: 'gpt-4', name: 'GPT-4' }],
+          gemini: [{ id: 'gemini-pro', name: 'Gemini Pro' }],
+        },
+      });
+
+      expect(
+        modelsConfig
+          .getAllConfiguredModels()
+          .filter((m) => m.authType !== 'qwen-oauth').length,
+      ).toBeGreaterThan(0);
+
+      // Reload with empty config
+      modelsConfig.reloadModelProvidersConfig({});
+
+      // Only qwen-oauth models should remain
+      const models = modelsConfig.getAllConfiguredModels();
+      expect(models.every((m) => m.authType === 'qwen-oauth')).toBe(true);
+    });
+
+    it('should preserve qwen-oauth models after reload', () => {
+      const modelsConfig = new ModelsConfig({
+        modelProvidersConfig: {
+          openai: [{ id: 'gpt-4', name: 'GPT-4' }],
+        },
+      });
+
+      const initialQwenModels = modelsConfig
+        .getAllConfiguredModels()
+        .filter((m) => m.authType === 'qwen-oauth');
+
+      modelsConfig.reloadModelProvidersConfig({
+        gemini: [{ id: 'gemini-pro', name: 'Gemini Pro' }],
+      });
+
+      // qwen-oauth models should still exist
+      const qwenModelsAfterReload = modelsConfig
+        .getAllConfiguredModels()
+        .filter((m) => m.authType === 'qwen-oauth');
+      expect(qwenModelsAfterReload.length).toBe(initialQwenModels.length);
+    });
+
+    it('should handle reload with undefined config', () => {
+      const modelsConfig = new ModelsConfig({
+        modelProvidersConfig: {
+          openai: [{ id: 'gpt-4', name: 'GPT-4' }],
+        },
+      });
+
+      expect(
+        modelsConfig
+          .getAllConfiguredModels()
+          .filter((m) => m.authType === 'openai').length,
+      ).toBeGreaterThan(0);
+
+      modelsConfig.reloadModelProvidersConfig(undefined);
+
+      // User-configured models should be cleared
+      expect(
+        modelsConfig
+          .getAllConfiguredModels()
+          .filter((m) => m.authType === 'openai').length,
+      ).toBe(0);
+    });
+
+    it('should support multiple reloads', () => {
+      const modelsConfig = new ModelsConfig();
+
+      // First reload
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [{ id: 'model-v1', name: 'Model V1' }],
+      });
+      expect(
+        modelsConfig.getAllConfiguredModels().some((m) => m.id === 'model-v1'),
+      ).toBe(true);
+
+      // Second reload
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [{ id: 'model-v2', name: 'Model V2' }],
+      });
+      expect(
+        modelsConfig.getAllConfiguredModels().some((m) => m.id === 'model-v1'),
+      ).toBe(false);
+      expect(
+        modelsConfig.getAllConfiguredModels().some((m) => m.id === 'model-v2'),
+      ).toBe(true);
+
+      // Third reload with empty config
+      modelsConfig.reloadModelProvidersConfig({});
+      expect(
+        modelsConfig.getAllConfiguredModels().some((m) => m.id === 'model-v2'),
+      ).toBe(false);
+    });
+
+    it('should handle complex multi-authType reload', async () => {
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig: {
+          openai: [
+            { id: 'gpt-4', name: 'GPT-4' },
+            { id: 'gpt-3.5', name: 'GPT-3.5' },
+          ],
+          gemini: [{ id: 'gemini-pro', name: 'Gemini Pro' }],
+        },
+      });
+
+      // Reload with completely different config
+      modelsConfig.reloadModelProvidersConfig({
+        openai: [{ id: 'new-openai', name: 'New OpenAI' }],
+        anthropic: [{ id: 'claude', name: 'Claude' }],
+        gemini: [{ id: 'gemini-ultra', name: 'Gemini Ultra' }],
+      });
+
+      const allModels = modelsConfig.getAllConfiguredModels();
+
+      // Old models should be gone
+      expect(allModels.some((m) => m.id === 'gpt-4')).toBe(false);
+      expect(allModels.some((m) => m.id === 'gpt-3.5')).toBe(false);
+      expect(allModels.some((m) => m.id === 'gemini-pro')).toBe(false);
+
+      // New models should exist
+      expect(allModels.some((m) => m.id === 'new-openai')).toBe(true);
+      expect(allModels.some((m) => m.id === 'claude')).toBe(true);
+      expect(allModels.some((m) => m.id === 'gemini-ultra')).toBe(true);
+    });
+  });
+
+  describe('max_tokens in modelsConfig', () => {
+    it('should not auto-fill max_tokens when samplingParams is undefined', async () => {
+      const modelProvidersConfig: ModelProvidersConfig = {
+        openai: [
+          {
+            id: 'gpt-4',
+            name: 'GPT-4',
+            baseUrl: 'https://api.openai.example.com/v1',
+            // No generationConfig.samplingParams defined
+          },
+        ],
+      };
+
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig,
+      });
+
+      await modelsConfig.switchModel(AuthType.USE_OPENAI, 'gpt-4');
+
+      const gc = currentGenerationConfig(modelsConfig);
+      expect(gc.samplingParams).toBeUndefined();
+    });
+
+    it('should not auto-fill max_tokens when samplingParams exists but max_tokens is missing', async () => {
+      const modelProvidersConfig: ModelProvidersConfig = {
+        openai: [
+          {
+            id: 'gpt-4',
+            name: 'GPT-4',
+            baseUrl: 'https://api.openai.example.com/v1',
+            generationConfig: {
+              samplingParams: { temperature: 0.7 }, // max_tokens not defined
+            },
+          },
+        ],
+      };
+
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig,
+      });
+
+      await modelsConfig.switchModel(AuthType.USE_OPENAI, 'gpt-4');
+
+      const gc = currentGenerationConfig(modelsConfig);
+      // Should preserve existing sampling params but not inject max_tokens
+      expect(gc.samplingParams?.temperature).toBe(0.7);
+      expect(gc.samplingParams?.max_tokens).toBeUndefined();
+
+      const sources = modelsConfig.getGenerationConfigSources();
+      expect(sources['samplingParams']?.kind).toBe('modelProviders');
+    });
+
+    it('should not override existing max_tokens from modelProviders', async () => {
+      const modelProvidersConfig: ModelProvidersConfig = {
+        openai: [
+          {
+            id: 'gpt-4',
+            name: 'GPT-4',
+            baseUrl: 'https://api.openai.example.com/v1',
+            generationConfig: {
+              samplingParams: { temperature: 0.7, max_tokens: 4096 },
+            },
+          },
+        ],
+      };
+
+      const modelsConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_OPENAI,
+        modelProvidersConfig,
+      });
+
+      await modelsConfig.switchModel(AuthType.USE_OPENAI, 'gpt-4');
+
+      const gc = currentGenerationConfig(modelsConfig);
+      // Should preserve both values from provider
+      expect(gc.samplingParams?.temperature).toBe(0.7);
+      expect(gc.samplingParams?.max_tokens).toBe(4096);
+
+      const sources = modelsConfig.getGenerationConfigSources();
+      expect(sources['samplingParams']?.kind).toBe('modelProviders');
+    });
+
+    it('should not auto-fill max_tokens for different model families', async () => {
+      const modelProvidersConfig: ModelProvidersConfig = {
+        anthropic: [
+          {
+            id: 'claude-3-opus',
+            name: 'Claude 3 Opus',
+            baseUrl: 'https://api.anthropic.example.com/v1',
+          },
+        ],
+        gemini: [
+          {
+            id: 'gemini-pro',
+            name: 'Gemini Pro',
+            baseUrl: 'https://api.gemini.example.com/v1',
+          },
+        ],
+      };
+
+      // Test Claude model without provider max_tokens
+      const claudeConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_ANTHROPIC,
+        modelProvidersConfig,
+      });
+
+      await claudeConfig.switchModel(AuthType.USE_ANTHROPIC, 'claude-3-opus');
+
+      let gc = currentGenerationConfig(claudeConfig);
+      expect(gc.samplingParams).toBeUndefined();
+
+      // Test Gemini model without provider max_tokens
+      const geminiConfig = new ModelsConfig({
+        initialAuthType: AuthType.USE_GEMINI,
+        modelProvidersConfig,
+      });
+
+      await geminiConfig.switchModel(AuthType.USE_GEMINI, 'gemini-pro');
+
+      gc = currentGenerationConfig(geminiConfig);
+      expect(gc.samplingParams).toBeUndefined();
     });
   });
 });

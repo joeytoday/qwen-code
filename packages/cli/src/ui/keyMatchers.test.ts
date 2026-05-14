@@ -11,6 +11,7 @@ import { defaultKeyBindings } from '../config/keyBindings.js';
 import type { Key } from './hooks/useKeypress.js';
 
 describe('keyMatchers', () => {
+  const isWindows = process.platform === 'win32';
   const createKey = (name: string, mods: Partial<Key> = {}): Key => ({
     name,
     ctrl: false,
@@ -49,7 +50,8 @@ describe('keyMatchers', () => {
       key.name === 'return' && (key.ctrl || key.meta || key.paste),
     [Command.OPEN_EXTERNAL_EDITOR]: (key: Key) =>
       key.ctrl && (key.name === 'x' || key.sequence === '\x18'),
-    [Command.PASTE_CLIPBOARD_IMAGE]: (key: Key) => key.ctrl && key.name === 'v',
+    [Command.PASTE_CLIPBOARD_IMAGE]: (key: Key) =>
+      (isWindows ? key.meta : key.ctrl || key.meta) && key.name === 'v',
     [Command.TOGGLE_TOOL_DESCRIPTIONS]: (key: Key) =>
       key.ctrl && key.name === 't',
     [Command.TOGGLE_IDE_CONTEXT_DETAIL]: (key: Key) =>
@@ -57,6 +59,11 @@ describe('keyMatchers', () => {
     [Command.QUIT]: (key: Key) => key.ctrl && key.name === 'c',
     [Command.EXIT]: (key: Key) => key.ctrl && key.name === 'd',
     [Command.SHOW_MORE_LINES]: (key: Key) => key.ctrl && key.name === 's',
+    [Command.RETRY_LAST]: (key: Key) => key.ctrl && key.name === 'y',
+    [Command.TOGGLE_COMPACT_MODE]: (key: Key) => key.ctrl && key.name === 'o',
+    [Command.TOGGLE_RENDER_MODE]: (key: Key) => key.meta && key.name === 'm',
+    [Command.PROMOTE_SHELL_TO_BACKGROUND]: (key: Key) =>
+      key.ctrl && key.name === 'b',
     [Command.REVERSE_SEARCH]: (key: Key) => key.ctrl && key.name === 'r',
     [Command.SUBMIT_REVERSE_SEARCH]: (key: Key) =>
       key.name === 'return' && !key.ctrl,
@@ -216,8 +223,12 @@ describe('keyMatchers', () => {
     },
     {
       command: Command.PASTE_CLIPBOARD_IMAGE,
-      positive: [createKey('v', { ctrl: true })],
-      negative: [createKey('v'), createKey('c', { ctrl: true })],
+      positive: isWindows
+        ? [createKey('v', { meta: true })]
+        : [createKey('v', { ctrl: true }), createKey('v', { meta: true })],
+      negative: isWindows
+        ? [createKey('v', { ctrl: true }), createKey('v')]
+        : [createKey('v'), createKey('c', { ctrl: true })],
     },
 
     // App level bindings
@@ -246,6 +257,16 @@ describe('keyMatchers', () => {
       positive: [createKey('s', { ctrl: true })],
       negative: [createKey('s'), createKey('l', { ctrl: true })],
     },
+    {
+      command: Command.RETRY_LAST,
+      positive: [createKey('y', { ctrl: true })],
+      negative: [createKey('y'), createKey('r', { ctrl: true })],
+    },
+    {
+      command: Command.TOGGLE_COMPACT_MODE,
+      positive: [createKey('o', { ctrl: true })],
+      negative: [createKey('o'), createKey('p', { ctrl: true })],
+    },
 
     // Shell commands
     {
@@ -267,6 +288,27 @@ describe('keyMatchers', () => {
       command: Command.TOGGLE_SHELL_INPUT_FOCUS,
       positive: [createKey('f', { ctrl: true })],
       negative: [createKey('f')],
+    },
+    {
+      command: Command.TOGGLE_RENDER_MODE,
+      positive: [createKey('m', { meta: true })],
+      negative: [
+        createKey('m'),
+        createKey('m', { ctrl: true }),
+        createKey('', { sequence: 'µ' }),
+        createKey('', { sequence: 'µ', paste: true }),
+      ],
+    },
+    {
+      command: Command.PROMOTE_SHELL_TO_BACKGROUND,
+      positive: [createKey('b', { ctrl: true })],
+      // No bare `b`, no Ctrl+other, no meta+b — Ctrl is required so
+      // typing `b` mid-prompt isn't accidentally swallowed.
+      negative: [
+        createKey('b'),
+        createKey('b', { meta: true }),
+        createKey('a', { ctrl: true }),
+      ],
     },
   ];
 

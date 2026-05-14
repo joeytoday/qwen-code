@@ -7,7 +7,13 @@
 import { useCallback } from 'react';
 import { SettingScope } from '../../config/settings.js';
 import type { AuthType, ApprovalMode } from '@qwen-code/qwen-code-core';
-import type { OpenAICredentials } from '../components/OpenAIKeyPrompt.js';
+import type { ArenaDialogType } from './useArenaCommand.js';
+// OpenAICredentials type (previously imported from OpenAIKeyPrompt)
+interface OpenAICredentials {
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+}
 
 export interface DialogCloseOptions {
   // Theme dialog
@@ -37,12 +43,28 @@ export interface DialogCloseOptions {
   isSettingsDialogOpen: boolean;
   closeSettingsDialog: () => void;
 
+  // Memory dialog
+  isMemoryDialogOpen: boolean;
+  closeMemoryDialog: () => void;
+
+  // Arena dialogs
+  activeArenaDialog: ArenaDialogType;
+  closeArenaDialog: () => void;
+
   // Folder trust dialog
   isFolderTrustDialogOpen: boolean;
 
   // Welcome back dialog
   showWelcomeBackDialog: boolean;
   handleWelcomeBackClose: () => void;
+
+  // Help dialog
+  isHelpDialogOpen?: boolean;
+  closeHelpDialog?: () => void;
+
+  // Background tasks dialog
+  isBackgroundTasksDialogOpen: boolean;
+  closeBackgroundTasksDialog: () => void;
 }
 
 /**
@@ -78,6 +100,21 @@ export function useDialogClose(options: DialogCloseOptions) {
       return true;
     }
 
+    if (options.isHelpDialogOpen && options.closeHelpDialog) {
+      options.closeHelpDialog();
+      return true;
+    }
+
+    if (options.isMemoryDialogOpen) {
+      options.closeMemoryDialog();
+      return true;
+    }
+
+    if (options.activeArenaDialog !== null) {
+      options.closeArenaDialog();
+      return true;
+    }
+
     if (options.isFolderTrustDialogOpen) {
       // FolderTrustDialog doesn't expose close function, but ESC would prevent exit
       // We follow the same pattern - prevent exit behavior
@@ -87,6 +124,14 @@ export function useDialogClose(options: DialogCloseOptions) {
     if (options.showWelcomeBackDialog) {
       // WelcomeBack has its own close handler
       options.handleWelcomeBackClose();
+      return true;
+    }
+
+    if (options.isBackgroundTasksDialogOpen) {
+      // Background tasks dialog — routed through closeAnyOpenDialog so
+      // Ctrl+C and the global escape path dismiss it without escalating
+      // to exit prompts.
+      options.closeBackgroundTasksDialog();
       return true;
     }
 

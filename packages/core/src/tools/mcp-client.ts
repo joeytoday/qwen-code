@@ -29,10 +29,12 @@ import { AuthProviderType, isSdkMcpServerConfig } from '../config/config.js';
 import { GoogleCredentialProvider } from '../mcp/google-auth-provider.js';
 import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-provider.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
+import type { McpToolAnnotations } from './mcp-tool.js';
 import { SdkControlClientTransport } from './sdk-control-client-transport.js';
 
 import type { FunctionDeclaration } from '@google/genai';
 import { mcpToTool } from '@google/genai';
+import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
@@ -41,6 +43,7 @@ import { OAuthUtils } from '../mcp/oauth-utils.js';
 import type { PromptRegistry } from '../prompts/prompt-registry.js';
 import { getErrorMessage } from '../utils/errors.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { normalizePathEnvForWindows } from '../utils/windowsPath.js';
 import type {
   Unsubscribe,
   WorkspaceContext,
@@ -162,34 +165,62 @@ export class McpClient {
 
   /**
    * Discovers tools and prompts from the MCP server.
+   *
+   * On error, the client's status is flipped to DISCONNECTED before the
+   * error is re-thrown. Without this, a server that connects successfully
+   * but then crashes (or returns no tools, or whose `tools/list` call
+   * rejects) would remain `CONNECTED` in the global status registry, and
+   * `Config.getFailedMcpServerNames()` — which filters by
+   * `status !== CONNECTED` — would silently omit it from the
+   * non-interactive failure banner. The caller (manager) still catches
+   * and logs; we just need the status registry to reflect reality.
    */
   async discover(cliConfig: Config): Promise<void> {
     if (this.status !== MCPServerStatus.CONNECTED) {
       throw new Error('Client is not connected.');
     }
 
-    const prompts = await this.discoverPrompts();
-    const tools = await this.discoverTools(cliConfig);
+    try {
+      const prompts = await this.discoverPrompts();
+      const tools = await this.discoverTools(cliConfig);
 
-    if (prompts.length === 0 && tools.length === 0) {
-      throw new Error('No prompts or tools found on the server.');
-    }
+      if (prompts.length === 0 && tools.length === 0) {
+        throw new Error('No prompts or tools found on the server.');
+      }
 
-    for (const tool of tools) {
-      this.toolRegistry.registerTool(tool);
+      for (const tool of tools) {
+        this.toolRegistry.registerTool(tool);
+      }
+    } catch (error) {
+      this.updateStatus(MCPServerStatus.DISCONNECTED);
+      throw error;
     }
   }
 
   /**
    * Disconnects from the MCP server.
+   *
+   * The intentional DISCONNECTED status update must reach the global
+   * registry — `getFailedMcpServerNames()` filters on `status !== CONNECTED`
+   * and the Footer's MCP health pill subscribes to the registry. Going
+   * through `updateStatus()` would have it swallowed by the
+   * `isDisconnecting` guard whose only purpose is to suppress LATE writes
+   * from a stale `connect()` catch. We therefore write the local field and
+   * the global registry directly, then flip `isDisconnecting = true` to
+   * shut down propagation from any in-flight `connect()` / `discover()`
+   * whose catch will fire after the transport has been torn down.
    */
   async disconnect(): Promise<void> {
+    // Set the local status BEFORE flipping `isDisconnecting`. A concurrent
+    // `discover()` reading `this.status` would otherwise see the stale
+    // CONNECTED value and try to register tools that we're about to drop.
+    this.status = MCPServerStatus.DISCONNECTED;
+    updateMCPServerStatus(this.serverName, MCPServerStatus.DISCONNECTED);
     this.isDisconnecting = true;
     if (this.transport) {
       await this.transport.close();
     }
     this.client.close();
-    this.updateStatus(MCPServerStatus.DISCONNECTED);
   }
 
   /**
@@ -221,6 +252,14 @@ export class McpClient {
 
   private updateStatus(status: MCPServerStatus): void {
     this.status = status;
+    // Once disconnect has begun, don't propagate further status changes to
+    // the global registry. An in-flight `connect()` whose catch block fires
+    // after `disableMcpServer` has already removed the entry would otherwise
+    // silently resurrect the server and the Footer's MCP health pill would
+    // continue to count it as offline.
+    if (this.isDisconnecting) {
+      return;
+    }
     updateMCPServerStatus(this.serverName, status);
   }
 
@@ -263,11 +302,14 @@ let mcpDiscoveryState: MCPDiscoveryState = MCPDiscoveryState.NOT_STARTED;
 export const mcpServerRequiresOAuth: Map<string, boolean> = new Map();
 
 /**
- * Event listeners for MCP server status changes
+ * Event listeners for MCP server status changes.
+ * `status` is `undefined` when the server has been removed from the registry
+ * (e.g. disabled via `/mcp`), so consumers can drop it from their snapshots
+ * rather than continue to count it as `DISCONNECTED`.
  */
 type StatusChangeListener = (
   serverName: string,
-  status: MCPServerStatus,
+  status: MCPServerStatus | undefined,
 ) => void;
 const statusChangeListeners: StatusChangeListener[] = [];
 
@@ -300,9 +342,26 @@ export function updateMCPServerStatus(
   status: MCPServerStatus,
 ): void {
   serverStatuses.set(serverName, status);
-  // Notify all listeners
-  for (const listener of statusChangeListeners) {
+  // Snapshot the listener list so a listener that detaches itself (or
+  // attaches a new one) during dispatch doesn't mutate the array we're
+  // iterating.
+  for (const listener of [...statusChangeListeners]) {
     listener(serverName, status);
+  }
+}
+
+/**
+ * Remove an MCP server from the status registry and notify listeners.
+ * Used when a server is disabled or removed from configuration so it no
+ * longer shows up in the Footer's MCP health pill as offline.
+ */
+export function removeMCPServerStatus(serverName: string): void {
+  if (!serverStatuses.has(serverName)) {
+    return;
+  }
+  serverStatuses.delete(serverName);
+  for (const listener of [...statusChangeListeners]) {
+    listener(serverName, undefined);
   }
 }
 
@@ -638,6 +697,24 @@ export async function discoverTools(
       return [];
     }
 
+    // Fetch raw tool list from MCP client to get annotations (readOnlyHint, etc.)
+    // that are not preserved by mcpToTool's functionDeclarations conversion.
+    const annotationsMap = new Map<string, McpToolAnnotations>();
+    try {
+      const listToolsResult = await mcpClient.listTools();
+      for (const mcpTool of listToolsResult.tools) {
+        if (mcpTool.annotations) {
+          annotationsMap.set(mcpTool.name, mcpTool.annotations);
+        }
+      }
+    } catch {
+      // If listTools fails, proceed without annotations — non-critical
+      debugLogger.error(
+        `Failed to fetch tool annotations from MCP server '${mcpServerName}'`,
+      );
+    }
+
+    const mcpTimeout = mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC;
     const discoveredTools: DiscoveredMCPTool[] = [];
     for (const funcDecl of tool.functionDeclarations) {
       try {
@@ -655,6 +732,9 @@ export async function discoverTools(
             mcpServerConfig.trust,
             undefined,
             cliConfig,
+            mcpClient, // raw MCP Client for direct callTool with progress
+            mcpTimeout,
+            annotationsMap.get(funcDecl.name!),
           ),
         );
       } catch (error) {
@@ -862,10 +942,14 @@ export async function connectToMcpServer(
       });
       return mcpClient;
     } catch (error) {
+      unlistenDirectories?.();
+      unlistenDirectories = undefined;
       await transport.close();
       throw error;
     }
   } catch (error) {
+    unlistenDirectories?.();
+    unlistenDirectories = undefined;
     // Check if this is a 401 error that might indicate OAuth is required
     const errorString = String(error);
     if (errorString.includes('401') && hasNetworkTransport(mcpServerConfig)) {
@@ -1376,13 +1460,25 @@ export async function createTransport(
   }
 
   if (mcpServerConfig.command) {
+    if (mcpServerConfig.cwd && !existsSync(mcpServerConfig.cwd)) {
+      throw new Error(
+        `MCP server '${mcpServerName}': configured cwd does not exist: ${mcpServerConfig.cwd}`,
+      );
+    }
+
+    // Normalize process.env PATH first (merge PATH+Path → single PATH on
+    // Windows), then apply server-specific overrides on top so that a server
+    // config providing its own PATH fully replaces the parent value instead of
+    // being merged with a stale case-variant.
+    const env = {
+      ...normalizePathEnvForWindows({ ...process.env }),
+      ...(mcpServerConfig.env || {}),
+    };
+
     const transport = new StdioClientTransport({
       command: mcpServerConfig.command,
       args: mcpServerConfig.args || [],
-      env: {
-        ...process.env,
-        ...(mcpServerConfig.env || {}),
-      } as Record<string, string>,
+      env: env as Record<string, string>,
       cwd: mcpServerConfig.cwd,
       stderr: 'pipe',
     });

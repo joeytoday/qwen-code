@@ -78,6 +78,8 @@ export type {
   AssistantMessageProps,
   AssistantMessageStatus,
 } from './components/messages/Assistant/AssistantMessage';
+export { InsightProgressCard } from './components/messages/InsightProgressCard.js';
+export type { InsightProgressCardProps } from './components/messages/InsightProgressCard.js';
 export {
   CollapsibleFileContent,
   parseContentWithFileReferences,
@@ -86,6 +88,22 @@ export type {
   CollapsibleFileContentProps,
   ContentSegment,
 } from './components/messages/CollapsibleFileContent';
+export { AskUserQuestionDialog } from './components/messages/AskUserQuestionDialog';
+export type {
+  AskUserQuestionDialogProps,
+  Question,
+  QuestionOption,
+} from './components/messages/AskUserQuestionDialog';
+export {
+  ImagePreview,
+  ImageMessageRenderer,
+} from './components/messages/ImageComponents';
+export type {
+  ImagePreviewProps,
+  ImagePreviewItem,
+  ImageMessageRendererProps,
+  ImageMessageLike,
+} from './components/messages/ImageComponents';
 
 // ChatViewer - standalone chat display component
 export {
@@ -135,8 +153,10 @@ export {
   mapToolStatusToContainerStatus,
   // Business ToolCall components
   ThinkToolCall,
-  SaveMemoryToolCall,
   GenericToolCall,
+  AgentToolCall,
+  isAgentExecutionRawOutput,
+  isAgentExecutionToolCall,
   EditToolCall,
   WriteToolCall,
   SearchToolCall,
@@ -145,9 +165,15 @@ export {
   ReadToolCall,
   WebFetchToolCall,
   CheckboxDisplay,
+  getToolCallComponent,
 } from './components/toolcalls';
 export type {
   ToolCallContainerProps,
+  AgentExecutionRawOutput,
+  AgentExecutionStatus,
+  AgentExecutionSummary,
+  AgentExecutionToolCall,
+  AgentToolCallStatus,
   ToolCallContent,
   ToolCallData,
   BaseToolCallProps,
@@ -215,6 +241,12 @@ export { StopIcon } from './components/icons/StopIcon';
 // Hooks
 export { useTheme } from './hooks/useTheme';
 export { useLocalStorage } from './hooks/useLocalStorage';
+export { useFollowupSuggestions } from './hooks/useFollowupSuggestions';
+export type {
+  FollowupState,
+  UseFollowupSuggestionsOptions,
+  UseFollowupSuggestionsReturn,
+} from './hooks/useFollowupSuggestions';
 
 // Types
 export type { Theme } from './types/theme';
@@ -229,6 +261,10 @@ export type { CompletionItem, CompletionItemType } from './types/completion';
 // Utils
 export { groupSessionsByDate, getTimeAgo } from './utils/sessionGrouping';
 export type { SessionGroup } from './utils/sessionGrouping';
+export {
+  ZERO_WIDTH_SPACE,
+  stripZeroWidthSpaces,
+} from './utils/inputPlaceholder';
 
 // Adapters - for normalizing different data formats
 export {

@@ -12,6 +12,7 @@ import os from 'node:os';
 import type { PartListUnion } from '@google/genai';
 import { readManyFiles } from './readManyFiles.js';
 import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
+import { StandardFileSystemService } from '../services/fileSystemService.js';
 import type { Config } from '../config/config.js';
 import { createMockWorkspaceContext } from '../test-utils/mockWorkspaceContext.js';
 
@@ -44,6 +45,7 @@ describe('readManyFiles', () => {
       getWorkspaceContext: () => createMockWorkspaceContext(rootDir),
       getTruncateToolOutputLines: () => 1000,
       getTruncateToolOutputThreshold: () => 2500,
+      getFileSystemService: () => new StandardFileSystemService(),
     }) as unknown as Config;
 
   async function createTestFile(
@@ -293,6 +295,30 @@ describe('readManyFiles', () => {
 
       expect(result.files).toHaveLength(0);
       expect(result.error).toBeDefined();
+    });
+  });
+
+  describe('per-file error surfacing', () => {
+    it('should surface processSingleFileContent errors instead of silently skipping the file', async () => {
+      // Trigger the >10MB file-size error path in processSingleFileContent.
+      const relativePath = 'huge.bin';
+      const absolutePath = path.join(tempRootDir, relativePath);
+      // 10MB + 1 byte to cross the 9.9MB threshold.
+      await fs.writeFile(absolutePath, Buffer.alloc(10 * 1024 * 1024 + 1));
+
+      const mockConfig = createMockConfig(tempRootDir);
+      const result = await readManyFiles(mockConfig, { paths: [relativePath] });
+
+      const content = contentToString(result.contentParts);
+      expect(content).toContain('File size exceeds the 10MB limit');
+      expect(content).not.toContain(
+        'No files matching the criteria were found',
+      );
+      expect(result.files).toHaveLength(1);
+      expect(result.files[0]!.filePath).toBe(absolutePath);
+      // Downstream callers (e.g. atCommandProcessor) inspect this field to
+      // render the read as failed rather than successful.
+      expect(result.files[0]!.error).toMatch(/exceeds the 10MB limit/i);
     });
   });
 });

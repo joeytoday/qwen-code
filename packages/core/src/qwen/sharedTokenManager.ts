@@ -6,7 +6,6 @@
 
 import path from 'node:path';
 import { promises as fs, unlinkSync } from 'node:fs';
-import * as os from 'os';
 import { randomUUID } from 'node:crypto';
 
 import type { IQwenOAuth2Client } from './qwenOAuth2.js';
@@ -18,11 +17,11 @@ import {
   CredentialsClearRequiredError,
 } from './qwenOAuth2.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { Storage } from '../config/storage.js';
 
 const debugLogger = createDebugLogger('QWEN_OAUTH');
 
 // File System Configuration
-const QWEN_DIR = '.qwen';
 const QWEN_CREDENTIAL_FILENAME = 'oauth_creds.json';
 const QWEN_LOCK_FILENAME = 'oauth_creds.lock';
 
@@ -468,6 +467,7 @@ export class SharedTokenManager {
   ): Promise<QwenCredentials> {
     const startTime = Date.now();
     const lockPath = this.getLockFilePath();
+    let lockAcquired = false;
 
     try {
       // Check if we have a refresh token before attempting refresh
@@ -482,6 +482,7 @@ export class SharedTokenManager {
 
       // Acquire distributed file lock
       await this.acquireLock(lockPath);
+      lockAcquired = true;
 
       // Check if the operation is taking too long
       const lockAcquisitionTime = Date.now() - startTime;
@@ -596,8 +597,10 @@ export class SharedTokenManager {
         error,
       );
     } finally {
-      // Always release the file lock
-      await this.releaseLock(lockPath);
+      // Only release the file lock if it was successfully acquired
+      if (lockAcquired) {
+        await this.releaseLock(lockPath);
+      }
     }
   }
 
@@ -687,7 +690,7 @@ export class SharedTokenManager {
    * @returns The absolute path to the credentials file
    */
   private getCredentialFilePath(): string {
-    return path.join(os.homedir(), QWEN_DIR, QWEN_CREDENTIAL_FILENAME);
+    return path.join(Storage.getGlobalQwenDir(), QWEN_CREDENTIAL_FILENAME);
   }
 
   /**
@@ -696,7 +699,7 @@ export class SharedTokenManager {
    * @returns The absolute path to the lock file
    */
   private getLockFilePath(): string {
-    return path.join(os.homedir(), QWEN_DIR, QWEN_LOCK_FILENAME);
+    return path.join(Storage.getGlobalQwenDir(), QWEN_LOCK_FILENAME);
   }
 
   /**

@@ -5,7 +5,7 @@
  */
 
 import { AuthType } from '@qwen-code/qwen-code-core';
-import type { AuthMethod } from './schema.js';
+import type { AuthMethod } from '@agentclientprotocol/sdk';
 
 export function buildAuthMethods(): AuthMethod[] {
   return [
@@ -13,16 +13,19 @@ export function buildAuthMethods(): AuthMethod[] {
       id: AuthType.USE_OPENAI,
       name: 'Use OpenAI API key',
       description: 'Requires setting the `OPENAI_API_KEY` environment variable',
-      type: 'terminal',
-      args: ['--auth-type=openai'],
+      _meta: {
+        type: 'terminal',
+        args: ['--auth-type=openai'],
+      },
     },
     {
       id: AuthType.QWEN_OAUTH,
       name: 'Qwen OAuth',
-      description:
-        'OAuth authentication for Qwen models with free daily requests',
-      type: 'terminal',
-      args: ['--auth-type=qwen-oauth'],
+      description: 'Qwen OAuth (free tier discontinued 2026-04-15)',
+      _meta: {
+        type: 'terminal',
+        args: ['--auth-type=qwen-oauth'],
+      },
     },
   ];
 }
